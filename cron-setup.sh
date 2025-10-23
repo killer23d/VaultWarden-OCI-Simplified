@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# cron-setup.sh - Simplified cron job management for VaultWarden-OCI-NG
-# Replaces: Complex cron management library
+# cron-setup.sh - Simplified cron job management with library integration
+# Uses centralized library functions
 
 set -euo pipefail
 
@@ -9,8 +9,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$SCRIPT_DIR"
 cd "$PROJECT_ROOT"
 
-# Source common library
-source lib/common.sh
+# --- Source Libraries ---
+source "lib/common.sh"
 init_common_lib "$0"
 
 # --- Configuration ---
@@ -56,15 +56,15 @@ done
 
 # --- Validation ---
 validate_environment() {
-    # Check if running as root
+    # Check if running as root using library function
     if ! is_root; then
         log_error "Cron setup requires root privileges"
         log_info "Run with: sudo ./cron-setup.sh"
         return 1
     fi
 
-    # Check required commands
-    require_commands crontab
+    # Check required commands using library function
+    require_commands crontab || return 1
 
     # Ensure project scripts are executable
     local scripts=("backup.sh" "health.sh" "update.sh")
@@ -102,6 +102,8 @@ remove_vaultwarden_crons() {
 
     # Filter out VaultWarden-related cron jobs
     temp_crons=$(mktemp)
+    setup_cleanup_trap "rm -f '$temp_crons'"
+
     echo "$current_crons" | grep -v "# VaultWarden-OCI-NG" | grep -v "$PROJECT_ROOT" > "$temp_crons" || true
 
     # Install filtered crontab
@@ -109,18 +111,16 @@ remove_vaultwarden_crons() {
         log_success "VaultWarden cron jobs removed"
     else
         log_error "Failed to update crontab"
-        rm -f "$temp_crons"
         return 1
     fi
 
-    rm -f "$temp_crons"
     return 0
 }
 
 install_vaultwarden_crons() {
     log_info "Installing VaultWarden cron jobs..."
 
-    # Get real user (in case we're running under sudo)
+    # Get real user using library function
     local real_user
     real_user=$(get_real_user)
 
@@ -154,9 +154,10 @@ EOF
     fi
 
     # Get current crontab and append new jobs
-    local current_crons new_crons temp_file
+    local current_crons temp_file
     current_crons=$(get_current_crontab)
     temp_file=$(mktemp)
+    setup_cleanup_trap "rm -f '$temp_file'"
 
     # Remove any existing VaultWarden crons first
     if [[ -n "$current_crons" ]]; then
@@ -172,11 +173,8 @@ EOF
         log_success "VaultWarden cron jobs installed"
     else
         log_error "Failed to install crontab"
-        rm -f "$temp_file"
         return 1
     fi
-
-    rm -f "$temp_file"
 
     # Verify cron service is running
     if systemctl is-active cron >/dev/null 2>&1 || systemctl is-active crond >/dev/null 2>&1; then
@@ -214,7 +212,7 @@ show_current_crons() {
     echo ""
 }
 
-# --- Logging Configuration ---
+# --- Log Rotation Configuration ---
 setup_log_rotation() {
     log_info "Setting up log rotation for VaultWarden..."
 
@@ -228,6 +226,9 @@ setup_log_rotation() {
     fi
 
     # Create logrotate configuration
+    local real_user
+    real_user=$(get_real_user)
+
     cat > "$logrotate_conf" << EOF
 # VaultWarden-OCI-NG Log Rotation
 $state_dir/logs/*/*.log {
@@ -237,7 +238,7 @@ $state_dir/logs/*/*.log {
     delaycompress
     missingok
     notifempty
-    create 644 $(get_real_user) $(get_real_user)
+    create 644 $real_user $real_user
     postrotate
         # Send HUP signal to containers to reopen log files
         docker compose -f $PROJECT_ROOT/docker-compose.yml kill -s HUP caddy || true
@@ -258,19 +259,94 @@ EOF
     return 0
 }
 
+# --- Cron Service Management ---
+ensure_cron_service() {
+    log_info "Ensuring cron service is enabled and running..."
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_info "[DRY RUN] Would check and start cron service"
+        return 0
+    fi
+
+    # Try both cron and crond service names
+    local cron_service=""
+    if systemctl list-unit-files | grep -q "^cron.service"; then
+        cron_service="cron"
+    elif systemctl list-unit-files | grep -q "^crond.service"; then
+        cron_service="crond"
+    else
+        log_warn "Could not find cron service"
+        return 1
+    fi
+
+    # Enable and start cron service
+    if ! systemctl is-enabled "$cron_service" >/dev/null 2>&1; then
+        log_info "Enabling cron service..."
+        systemctl enable "$cron_service" || log_warn "Failed to enable cron service"
+    fi
+
+    if ! systemctl is-active "$cron_service" >/dev/null 2>&1; then
+        log_info "Starting cron service..."
+        systemctl start "$cron_service" || {
+            log_error "Failed to start cron service"
+            return 1
+        }
+    fi
+
+    log_success "Cron service is running and enabled"
+    return 0
+}
+
+# --- Configuration Validation ---
+validate_scripts() {
+    log_info "Validating automation scripts..."
+
+    local scripts=("backup.sh" "health.sh" "update.sh")
+    local missing_scripts=()
+    local non_executable=()
+
+    for script in "${scripts[@]}"; do
+        if [[ ! -f "$PROJECT_ROOT/$script" ]]; then
+            missing_scripts+=("$script")
+        elif [[ ! -x "$PROJECT_ROOT/$script" ]]; then
+            non_executable+=("$script")
+        fi
+    done
+
+    if [[ ${#missing_scripts[@]} -gt 0 ]]; then
+        log_error "Missing required scripts: ${missing_scripts[*]}"
+        return 1
+    fi
+
+    if [[ ${#non_executable[@]} -gt 0 ]]; then
+        log_warn "Making scripts executable: ${non_executable[*]}"
+        if [[ "$DRY_RUN" != "true" ]]; then
+            for script in "${non_executable[@]}"; do
+                chmod +x "$PROJECT_ROOT/$script"
+            done
+        fi
+    fi
+
+    log_success "All automation scripts are available and executable"
+    return 0
+}
+
 # --- Main Execution ---
 main() {
-    log_header "VaultWarden Cron Setup"
+    log_info "VaultWarden Cron Setup"
 
     validate_environment || exit 1
 
-    # Load configuration if available
+    # Load configuration if available using library function
     load_env_file 2>/dev/null || log_warn "No .env file found, using defaults"
 
     if [[ "$REMOVE_CRONS" == "true" ]]; then
         remove_vaultwarden_crons || exit 1
     else
         show_current_crons
+
+        # Validate scripts before installing crons
+        validate_scripts || exit 1
 
         # Ask for confirmation unless dry run
         if [[ "$DRY_RUN" == "false" ]]; then
@@ -282,7 +358,13 @@ main() {
             fi
         fi
 
+        # Ensure cron service is running
+        ensure_cron_service || log_warn "Cron service issues detected"
+
+        # Install cron jobs
         install_vaultwarden_crons || exit 1
+
+        # Setup log rotation
         setup_log_rotation || log_warn "Failed to setup log rotation (non-critical)"
 
         echo ""
@@ -295,8 +377,10 @@ main() {
         echo "  • Container updates: Sunday 3:00 AM"
         echo "  • System updates: First Sunday 4:00 AM"
         echo ""
-        echo "View cron jobs: sudo crontab -l"
-        echo "Check cron logs: sudo journalctl -u cron"
+        echo "Management Commands:"
+        echo "  • View cron jobs: sudo crontab -l"
+        echo "  • Check cron logs: sudo journalctl -u cron"
+        echo "  • Manual health check: ./health.sh --comprehensive"
     fi
 }
 

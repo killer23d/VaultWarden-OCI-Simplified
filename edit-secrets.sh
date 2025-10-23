@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# edit-secrets.sh - Simplified secrets management with SOPS/Age
-# Replaces: Complex secrets editing with validation
+# edit-secrets.sh - Simplified secrets management with library integration
+# Uses centralized library functions
 
 set -euo pipefail
 
@@ -9,16 +9,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$SCRIPT_DIR"
 cd "$PROJECT_ROOT"
 
-# --- Simple Logging ---
-log_info() { echo "[$(date '+%H:%M:%S')] [INFO] $*"; }
-log_warn() { echo "[$(date '+%H:%M:%S')] [WARN] $*" >&2; }
-log_error() { echo "[$(date '+%H:%M:%S')] [ERROR] $*" >&2; }
-log_success() { echo "[$(date '+%H:%M:%S')] [SUCCESS] $*"; }
+# --- Source Libraries ---
+source "lib/common.sh"
+init_common_lib "$0"
+source "lib/crypto.sh"
 
 # --- Configuration ---
 EDITOR="${EDITOR:-nano}"
 SECRETS_FILE="secrets/secrets.yaml"
-AGE_KEY_FILE="secrets/keys/age-key.txt"
 
 # --- Help ---
 show_help() {
@@ -62,33 +60,21 @@ done
 
 # --- Validation ---
 check_prerequisites() {
-    # Check required commands
-    local missing=()
-    for cmd in age sops "$EDITOR"; do
-        if ! command -v "$cmd" >/dev/null 2>&1; then
-            missing+=("$cmd")
-        fi
-    done
+    # Check required commands using library function
+    require_commands age "$EDITOR" || return 1
 
-    if [[ ${#missing[@]} -gt 0 ]]; then
-        log_error "Missing required commands: ${missing[*]}"
-        log_info "Install with: sudo apt install age sops ${missing[*]}"
+    # Check SOPS availability using library function
+    if ! check_sops_available; then
+        log_error "SOPS not available"
+        log_info "Install with: sudo apt install sops"
         return 1
     fi
 
-    # Check Age key exists
-    if [[ ! -f "$AGE_KEY_FILE" ]]; then
-        log_error "Age private key not found: $AGE_KEY_FILE"
+    # Check Age key using library function
+    if ! check_age_key; then
+        log_error "Age private key not available"
         log_info "Run ./setup.sh to generate keys"
         return 1
-    fi
-
-    # Check key permissions
-    local perms
-    perms=$(stat -c "%a" "$AGE_KEY_FILE" 2>/dev/null)
-    if [[ "$perms" != "600" ]]; then
-        log_warn "Age key has incorrect permissions ($perms), fixing..."
-        chmod 600 "$AGE_KEY_FILE"
     fi
 
     return 0
@@ -107,14 +93,13 @@ init_secrets() {
         fi
     fi
 
-    # Ensure secrets directory exists
-    mkdir -p "$(dirname "$SECRETS_FILE")"
+    # Ensure secrets directory exists using library function
+    ensure_dir "$(dirname "$SECRETS_FILE")" 700
 
-    # Generate secure random values
-    local admin_token smtp_pass backup_pass
-    admin_token=$(openssl rand -hex 32)
-    smtp_pass="CHANGE_ME_SMTP_PASSWORD"
-    backup_pass=$(openssl rand -base64 32)
+    # Generate secure random values using library function
+    local admin_token backup_pass
+    admin_token=$(generate_hex_string 32)
+    backup_pass=$(generate_secure_string 32)
 
     # Create template secrets file
     cat > "$SECRETS_FILE" << EOF
@@ -131,7 +116,7 @@ admin_token: $admin_token
 admin_basic_auth_hash: CHANGE_ME_BCRYPT_HASH
 
 # SMTP password for email notifications
-smtp_password: $smtp_pass
+smtp_password: CHANGE_ME_SMTP_PASSWORD
 
 # Backup encryption passphrase
 backup_passphrase: $backup_pass
@@ -146,10 +131,10 @@ EOF
     log_success "Template secrets file created"
     log_info "Now encrypting with SOPS..."
 
-    # Encrypt the file
-    if sops --encrypt --in-place "$SECRETS_FILE"; then
+    # Encrypt the file using library function
+    if sops_encrypt "$SECRETS_FILE"; then
         log_success "Secrets file encrypted successfully"
-        chmod 600 "$SECRETS_FILE"
+        secure_file "$SECRETS_FILE" 600
     else
         log_error "Failed to encrypt secrets file"
         return 1
@@ -181,7 +166,8 @@ show_secrets() {
 
     echo ""
     echo "=== DECRYPTED SECRETS ==="
-    if sops -d "$SECRETS_FILE"; then
+    # Use library function to decrypt
+    if sops_decrypt "$SECRETS_FILE"; then
         echo "========================="
         echo ""
         log_warn "Remember to keep these values secure!"
@@ -203,8 +189,14 @@ edit_secrets() {
         return 1
     fi
 
-    # Check if file is encrypted by trying to decrypt it
-    if ! sops -d "$SECRETS_FILE" >/dev/null 2>&1; then
+    # Check if file is encrypted using library function
+    if ! is_sops_encrypted "$SECRETS_FILE"; then
+        log_error "Secrets file is not encrypted with SOPS"
+        return 1
+    fi
+
+    # Test decryption using library function
+    if ! sops_decrypt "$SECRETS_FILE" >/dev/null 2>&1; then
         log_error "Cannot decrypt secrets file with current Age key"
         log_info "Check that Age key is correct and SOPS config is valid"
         return 1
@@ -214,17 +206,20 @@ edit_secrets() {
     log_info "The file will be automatically re-encrypted when you save and exit"
     echo ""
 
-    # Use SOPS to edit the file directly
-    if sops "$SECRETS_FILE"; then
+    # Use SOPS to edit the file directly using library function
+    if sops_edit "$SECRETS_FILE"; then
         log_success "Secrets updated successfully"
 
-        # Verify the file is still properly encrypted
-        if sops -d "$SECRETS_FILE" >/dev/null 2>&1; then
+        # Verify the file is still properly encrypted using library function
+        if is_sops_encrypted "$SECRETS_FILE"; then
             log_success "Secrets file encryption verified"
         else
             log_error "Warning: Secrets file may not be properly encrypted"
             return 1
         fi
+
+        # Set proper permissions using library function
+        secure_file "$SECRETS_FILE" 600
 
         # Remind about restarting services
         echo ""
@@ -244,16 +239,15 @@ generate_password_hash() {
     log_info "Password Hash Generator"
     echo ""
 
-    if ! command -v argon2 >/dev/null 2>&1; then
+    if ! has_command argon2; then
         log_warn "argon2 command not found, using openssl alternative"
         log_info "Install argon2: sudo apt install argon2"
         echo ""
 
         read -s -p "Enter password: " password
         echo ""
-        local salt
-        salt=$(openssl rand -base64 16)
-        local hash
+        local salt hash
+        salt=$(generate_secure_string 16)
         hash=$(echo -n "$password" | openssl dgst -sha256 -binary | openssl base64)
         echo ""
         log_info "Basic SHA256 hash (less secure than bcrypt/argon2):"
@@ -265,7 +259,7 @@ generate_password_hash() {
         read -s -p "Enter password: " password
         echo ""
         local salt hash
-        salt=$(openssl rand -base64 32)
+        salt=$(generate_secure_string 32)
         hash=$(echo -n "$password" | argon2 "$salt" -e -id -k 65536 -t 3 -p 4)
         echo ""
         log_success "Argon2 hash generated:"
@@ -274,6 +268,46 @@ generate_password_hash() {
 
     echo ""
     log_info "Copy this hash to your secrets file as admin_basic_auth_hash"
+}
+
+# --- Test Secrets Access ---
+test_secrets_access() {
+    log_info "Testing secrets access..."
+
+    if [[ ! -f "$SECRETS_FILE" ]]; then
+        log_error "Secrets file not found: $SECRETS_FILE"
+        return 1
+    fi
+
+    # Test decryption using library function
+    if sops_decrypt "$SECRETS_FILE" >/dev/null 2>&1; then
+        log_success "Secrets file can be decrypted"
+
+        # Test individual secret access using library function
+        local test_secrets=("admin_token" "backup_passphrase")
+        local accessible_secrets=0
+
+        for secret in "${test_secrets[@]}"; do
+            if get_secret "$secret" >/dev/null 2>&1; then
+                ((accessible_secrets++))
+                log_success "Secret '$secret' accessible"
+            else
+                log_warn "Secret '$secret' not found or inaccessible"
+            fi
+        done
+
+        if [[ $accessible_secrets -eq ${#test_secrets[@]} ]]; then
+            log_success "All core secrets are accessible"
+        else
+            log_warn "Some secrets may be missing or misconfigured"
+        fi
+
+    else
+        log_error "Cannot decrypt secrets file"
+        return 1
+    fi
+
+    return 0
 }
 
 # --- Main Execution ---
@@ -310,15 +344,17 @@ main() {
         echo "1) Edit secrets"
         echo "2) Generate password hash"
         echo "3) Show current secrets"
-        echo "4) Exit"
+        echo "4) Test secrets access"
+        echo "5) Exit"
         echo ""
-        read -p "Choice (1-4): " choice
+        read -p "Choice (1-5): " choice
 
         case "$choice" in
             1) edit_secrets ;;
             2) generate_password_hash ;;
             3) show_secrets ;;
-            4) log_info "Goodbye"; exit 0 ;;
+            4) test_secrets_access ;;
+            5) log_info "Goodbye"; exit 0 ;;
             *) log_error "Invalid choice"; exit 1 ;;
         esac
     fi

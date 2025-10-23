@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# backup.sh - Simplified VaultWarden backup creation
-# Replaces: Complex backup monitoring and emergency kit creation
+# backup.sh - Simplified VaultWarden backup creation with library integration
+# Uses centralized library functions
 
 set -euo pipefail
 
@@ -9,11 +9,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$SCRIPT_DIR"
 cd "$PROJECT_ROOT"
 
-# --- Simple Logging ---
-log_info() { echo "[$(date '+%H:%M:%S')] [INFO] $*"; }
-log_warn() { echo "[$(date '+%H:%M:%S')] [WARN] $*" >&2; }
-log_error() { echo "[$(date '+%H:%M:%S')] [ERROR] $*" >&2; }
-log_success() { echo "[$(date '+%H:%M:%S')] [SUCCESS] $*"; }
+# --- Source Libraries ---
+source "lib/common.sh"
+init_common_lib "$0"
+source "lib/docker.sh"
+source "lib/crypto.sh"
 
 # --- Configuration ---
 BACKUP_TYPE="db"  # db, full, or emergency
@@ -58,23 +58,6 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# --- Load Configuration ---
-load_config() {
-    if [[ ! -f .env ]]; then
-        log_error "Configuration file .env not found"
-        return 1
-    fi
-
-    set -a
-    source .env
-    set +a
-
-    # Set defaults
-    PROJECT_STATE_DIR="${PROJECT_STATE_DIR:-/var/lib/vaultwarden}"
-
-    return 0
-}
-
 # --- Backup Functions ---
 create_db_backup() {
     log_info "Creating database backup..."
@@ -84,32 +67,31 @@ create_db_backup() {
     local backup_file="vw-db-backup-$timestamp.sqlite3.gz"
     local encrypted_file="$backup_file.age"
 
-    mkdir -p "$backup_dir"
+    ensure_dir "$backup_dir" 755
 
     # Check if VaultWarden is running
-    local vw_container
-    vw_container=$(docker compose ps -q vaultwarden 2>/dev/null || echo "")
-
-    if [[ -n "$vw_container" ]] && docker inspect "$vw_container" >/dev/null 2>&1; then
+    if is_service_running "vaultwarden"; then
         # Backup from running container
         log_info "Backing up database from running container..."
 
-        if ! docker exec "$vw_container" sqlite3 /data/db.sqlite3 ".backup /tmp/backup.db"; then
+        if ! exec_in_service vaultwarden sqlite3 /data/db.sqlite3 ".backup /tmp/backup.db"; then
             log_error "Failed to create database backup inside container"
             return 1
         fi
 
-        if ! docker cp "$vw_container:/tmp/backup.db" - | gzip > "$backup_dir/$backup_file"; then
+        if ! docker compose exec vaultwarden cat /tmp/backup.db | gzip > "$backup_dir/$backup_file"; then
             log_error "Failed to copy database backup from container"
             return 1
         fi
 
         # Cleanup temporary file in container
-        docker exec "$vw_container" rm -f /tmp/backup.db 2>/dev/null || true
+        exec_in_service vaultwarden rm -f /tmp/backup.db 2>/dev/null || true
 
     else
         # Backup from filesystem (container stopped)
-        local db_file="$PROJECT_STATE_DIR/data/bwdata/db.sqlite3"
+        local state_dir
+        state_dir=$(get_config_value "PROJECT_STATE_DIR" "/var/lib/vaultwarden")
+        local db_file="$state_dir/data/bwdata/db.sqlite3"
 
         if [[ ! -f "$db_file" ]]; then
             log_error "Database file not found: $db_file"
@@ -123,14 +105,16 @@ create_db_backup() {
         fi
     fi
 
-    # Encrypt backup
-    if ! encrypt_backup "$backup_dir/$backup_file" "$backup_dir/$encrypted_file"; then
+    # Encrypt backup using library function
+    if ! encrypt_file "$backup_dir/$backup_file" "$backup_dir/$encrypted_file"; then
         rm -f "$backup_dir/$backup_file"
+        log_error "Failed to encrypt backup"
         return 1
     fi
 
     # Remove unencrypted file
     rm -f "$backup_dir/$backup_file"
+    secure_file "$backup_dir/$encrypted_file" 600
 
     log_success "Database backup created: $encrypted_file"
     echo "$backup_dir/$encrypted_file"
@@ -145,35 +129,41 @@ create_full_backup() {
     local backup_file="vw-full-backup-$timestamp.tar.gz"
     local encrypted_file="$backup_file.age"
 
-    mkdir -p "$backup_dir"
+    ensure_dir "$backup_dir" 755
 
     # Create temporary directory for backup content
     local temp_dir
     temp_dir=$(mktemp -d)
-    trap "rm -rf '$temp_dir'" EXIT
+    setup_cleanup_trap "rm -rf '$temp_dir'"
 
     # Copy essential files
     log_info "Gathering configuration files..."
-    cp docker-compose.yml "$temp_dir/" 2>/dev/null || log_warn "docker-compose.yml not found"
-    cp .env "$temp_dir/" 2>/dev/null || log_warn ".env not found"
-    cp -r caddy "$temp_dir/" 2>/dev/null || log_warn "caddy/ directory not found"
-    cp -r fail2ban "$temp_dir/" 2>/dev/null || log_warn "fail2ban/ directory not found"
-    cp -r secrets "$temp_dir/" 2>/dev/null || log_warn "secrets/ directory not found"
+    [[ -f docker-compose.yml ]] && cp docker-compose.yml "$temp_dir/" || log_warn "docker-compose.yml not found"
+    [[ -f .env ]] && cp .env "$temp_dir/" || log_warn ".env not found"
+    [[ -d caddy ]] && cp -r caddy "$temp_dir/" || log_warn "caddy/ directory not found"
+    [[ -d fail2ban ]] && cp -r fail2ban "$temp_dir/" || log_warn "fail2ban/ directory not found"
+    [[ -d secrets ]] && cp -r secrets "$temp_dir/" || log_warn "secrets/ directory not found"
 
     # Copy data directory
     log_info "Including data directory..."
-    if [[ -d "$PROJECT_STATE_DIR/data" ]]; then
+    local state_dir
+    state_dir=$(get_config_value "PROJECT_STATE_DIR" "/var/lib/vaultwarden")
+    if [[ -d "$state_dir/data" ]]; then
         mkdir -p "$temp_dir/data"
-        cp -r "$PROJECT_STATE_DIR/data"/* "$temp_dir/data/" 2>/dev/null || log_warn "Failed to copy some data files"
+        cp -r "$state_dir/data"/* "$temp_dir/data/" 2>/dev/null || log_warn "Failed to copy some data files"
     fi
 
     # Create system info file
+    local domain admin_email
+    domain=$(get_config_value "DOMAIN" "Not configured")
+    admin_email=$(get_config_value "ADMIN_EMAIL" "Not configured")
+
     cat > "$temp_dir/backup-info.txt" << EOF
 VaultWarden-OCI-NG Full Backup
 Created: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
 Host: $(hostname -f 2>/dev/null || hostname)
-Domain: ${DOMAIN:-Not configured}
-Admin Email: ${ADMIN_EMAIL:-Not configured}
+Domain: $domain
+Admin Email: $admin_email
 EOF
 
     # Create compressed archive
@@ -183,14 +173,16 @@ EOF
         return 1
     fi
 
-    # Encrypt backup
-    if ! encrypt_backup "$backup_dir/$backup_file" "$backup_dir/$encrypted_file"; then
+    # Encrypt backup using library function
+    if ! encrypt_file "$backup_dir/$backup_file" "$backup_dir/$encrypted_file"; then
         rm -f "$backup_dir/$backup_file"
+        log_error "Failed to encrypt backup"
         return 1
     fi
 
     # Remove unencrypted file
     rm -f "$backup_dir/$backup_file"
+    secure_file "$backup_dir/$encrypted_file" 600
 
     log_success "Full backup created: $encrypted_file"
     echo "$backup_dir/$encrypted_file"
@@ -205,27 +197,29 @@ create_emergency_kit() {
     local kit_file="emergency-kit-$timestamp.tar.gz"
     local encrypted_file="$kit_file.age"
 
-    mkdir -p "$backup_dir"
+    ensure_dir "$backup_dir" 755
 
     # Create temporary directory
     local temp_dir
     temp_dir=$(mktemp -d)
-    trap "rm -rf '$temp_dir'" EXIT
+    setup_cleanup_trap "rm -rf '$temp_dir'"
 
     # Include everything needed for disaster recovery
     log_info "Preparing recovery files..."
 
     # Configuration and secrets
-    cp docker-compose.yml "$temp_dir/" 2>/dev/null || { log_error "docker-compose.yml required"; return 1; }
-    cp .env "$temp_dir/" 2>/dev/null || { log_error ".env required"; return 1; }
-    cp -r caddy "$temp_dir/" 2>/dev/null || { log_error "caddy/ directory required"; return 1; }
-    cp -r fail2ban "$temp_dir/" 2>/dev/null || log_warn "fail2ban/ directory not found"
-    cp -r secrets "$temp_dir/" 2>/dev/null || { log_error "secrets/ directory required"; return 1; }
+    [[ -f docker-compose.yml ]] && cp docker-compose.yml "$temp_dir/" || { log_error "docker-compose.yml required"; return 1; }
+    [[ -f .env ]] && cp .env "$temp_dir/" || { log_error ".env required"; return 1; }
+    [[ -d caddy ]] && cp -r caddy "$temp_dir/" || { log_error "caddy/ directory required"; return 1; }
+    [[ -d fail2ban ]] && cp -r fail2ban "$temp_dir/" || log_warn "fail2ban/ directory not found"
+    [[ -d secrets ]] && cp -r secrets "$temp_dir/" || { log_error "secrets/ directory required"; return 1; }
 
     # Data backup
     mkdir -p "$temp_dir/data"
-    if [[ -d "$PROJECT_STATE_DIR/data" ]]; then
-        cp -r "$PROJECT_STATE_DIR/data"/* "$temp_dir/data/" 2>/dev/null || log_warn "Some data files could not be copied"
+    local state_dir
+    state_dir=$(get_config_value "PROJECT_STATE_DIR" "/var/lib/vaultwarden")
+    if [[ -d "$state_dir/data" ]]; then
+        cp -r "$state_dir/data"/* "$temp_dir/data/" 2>/dev/null || log_warn "Some data files could not be copied"
     fi
 
     # Recovery documentation
@@ -257,10 +251,14 @@ Recovery Time: ~15-30 minutes with proper preparation
 EOF
 
     # Create kit info
+    local domain admin_email
+    domain=$(get_config_value "DOMAIN" "Not configured")
+    admin_email=$(get_config_value "ADMIN_EMAIL" "Not configured")
+
     cat > "$temp_dir/kit-info.txt" << EOF
 Emergency Kit Created: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
 Source Host: $(hostname -f 2>/dev/null || hostname)  
-Domain: ${DOMAIN:-Not configured}
+Domain: $domain
 Kit Version: Simplified v1.0
 EOF
 
@@ -271,46 +269,20 @@ EOF
         return 1
     fi
 
-    # Encrypt kit
-    if ! encrypt_backup "$backup_dir/$kit_file" "$backup_dir/$encrypted_file"; then
+    # Encrypt kit using library function
+    if ! encrypt_file "$backup_dir/$kit_file" "$backup_dir/$encrypted_file"; then
         rm -f "$backup_dir/$kit_file"
+        log_error "Failed to encrypt emergency kit"
         return 1
     fi
 
     # Remove unencrypted file
     rm -f "$backup_dir/$kit_file"
+    secure_file "$backup_dir/$encrypted_file" 600
 
     log_success "Emergency kit created: $encrypted_file"
     log_warn "IMPORTANT: Store this kit and Age key separately and securely!"
     echo "$backup_dir/$encrypted_file"
-    return 0
-}
-
-# --- Encryption Function ---
-encrypt_backup() {
-    local input_file="$1"
-    local output_file="$2"
-
-    local public_key_file="secrets/keys/age-public-key.txt"
-
-    if [[ ! -f "$public_key_file" ]]; then
-        log_error "Age public key not found: $public_key_file"
-        log_info "Run ./setup.sh to generate keys"
-        return 1
-    fi
-
-    local public_key
-    public_key=$(cat "$public_key_file")
-
-    log_info "Encrypting backup with Age..."
-    if ! age -r "$public_key" -o "$output_file" "$input_file"; then
-        log_error "Failed to encrypt backup"
-        return 1
-    fi
-
-    # Set secure permissions
-    chmod 600 "$output_file"
-
     return 0
 }
 
@@ -323,8 +295,10 @@ email_backup() {
         return 1
     fi
 
-    # Simple email sending (requires configured SMTP)
-    if [[ -z "${SMTP_HOST:-}" ]]; then
+    # Check if SMTP is configured
+    local smtp_host
+    smtp_host=$(get_config_value "SMTP_HOST" "")
+    if [[ -z "$smtp_host" ]]; then
         log_warn "SMTP not configured, cannot email backup"
         log_info "Configure SMTP settings in secrets to enable email"
         return 1
@@ -332,14 +306,16 @@ email_backup() {
 
     log_info "Emailing backup..."
     local subject="VaultWarden Backup - $(date '+%Y-%m-%d %H:%M')"
-    local size
-    size=$(du -h "$backup_file" | cut -f1)
+    local admin_email
+    admin_email=$(get_config_value "ADMIN_EMAIL")
 
     # Use simple mail command if available
-    if command -v mail >/dev/null; then
-        echo "VaultWarden backup created: $(basename "$backup_file") ($size)" |         mail -s "$subject" -A "$backup_file" "${ADMIN_EMAIL}"
+    if has_command mail; then
+        local size
+        size=$(du -h "$backup_file" | cut -f1)
+        echo "VaultWarden backup created: $(basename "$backup_file") ($size)" |         mail -s "$subject" -A "$backup_file" "$admin_email"
 
-        log_success "Backup emailed to ${ADMIN_EMAIL}"
+        log_success "Backup emailed to $admin_email"
     else
         log_warn "Mail command not available, cannot send email"
         log_info "Install mailutils package to enable email: sudo apt install mailutils"
@@ -373,7 +349,21 @@ cleanup_old_backups() {
 main() {
     log_info "VaultWarden Backup Tool"
 
-    load_config || exit 1
+    # Load configuration
+    load_env_file || {
+        log_error "Failed to load configuration"
+        exit 1
+    }
+
+    # Check required commands
+    require_commands tar gzip age || exit 1
+
+    # Check Age key availability
+    if ! check_age_key; then
+        log_error "Age encryption key not available"
+        log_info "Run ./setup.sh to generate keys"
+        exit 1
+    fi
 
     local backup_file=""
 

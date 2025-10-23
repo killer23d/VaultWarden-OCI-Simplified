@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# maintenance.sh - System maintenance and cleanup for VaultWarden-OCI-NG  
-# Replaces: Complex host maintenance scripts
+# maintenance.sh - System maintenance and cleanup with library integration
+# Uses centralized library functions
 
 set -euo pipefail
 
@@ -9,9 +9,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$SCRIPT_DIR"
 cd "$PROJECT_ROOT"
 
-# Source common library
-source lib/common.sh
+# --- Source Libraries ---
+source "lib/common.sh"
 init_common_lib "$0"
+source "lib/docker.sh"
+source "lib/crypto.sh"
 
 # --- Configuration ---
 DRY_RUN=false
@@ -72,68 +74,57 @@ validate_environment() {
 cleanup_docker() {
     log_info "Docker cleanup..."
 
-    if ! check_docker; then
+    # Check Docker availability using library function
+    if ! check_docker_available; then
         log_warn "Docker not available, skipping Docker cleanup"
         return 0
     fi
 
     local freed_space=0
 
-    # Clean up stopped containers
+    # Clean up stopped containers using library function
     log_info "Removing stopped containers..."
     if [[ "$DRY_RUN" == "true" ]]; then
         local stopped_containers
         stopped_containers=$(docker ps -aq --filter "status=exited" | wc -l)
         log_info "[DRY RUN] Would remove $stopped_containers stopped containers"
     else
-        local removed
-        removed=$(docker container prune -f 2>/dev/null | grep -o "deleted [0-9]*" | grep -o "[0-9]*" || echo "0")
-        log_success "Removed $removed stopped containers"
+        cleanup_containers
+        log_success "Stopped containers cleaned up"
     fi
 
-    # Clean up unused images
+    # Clean up unused images using library function
     log_info "Removing unused Docker images..."
     if [[ "$DRY_RUN" == "true" ]]; then
         log_info "[DRY RUN] Would run: docker image prune -f"
     else
-        local image_cleanup
-        image_cleanup=$(docker image prune -f 2>/dev/null || echo "")
-        if [[ -n "$image_cleanup" ]]; then
-            log_success "Docker images cleaned up"
-        else
-            log_info "No unused images to clean"
-        fi
+        cleanup_images
+        log_success "Unused images cleaned up"
     fi
 
-    # Clean up unused volumes (be careful - only truly unused ones)
+    # Clean up unused volumes using library function (be careful!)
     log_info "Checking for unused Docker volumes..."
     if [[ "$DRY_RUN" == "true" ]]; then
         local unused_volumes
         unused_volumes=$(docker volume ls -qf dangling=true | wc -l)
         log_info "[DRY RUN] Found $unused_volumes unused volumes"
     else
-        # Be very careful with volume cleanup - only remove truly dangling ones
-        local volume_cleanup
-        volume_cleanup=$(docker volume prune -f 2>/dev/null | grep -o "deleted [0-9]*" | grep -o "[0-9]*" || echo "0")
-        if [[ "$volume_cleanup" -gt 0 ]]; then
-            log_success "Removed $volume_cleanup unused volumes"
-        else
-            log_info "No unused volumes found"
-        fi
+        cleanup_volumes
+        log_success "Unused volumes cleaned up"
     fi
 
-    # Clean up unused networks
+    # Clean up unused networks using library function
     log_info "Cleaning up unused Docker networks..."
     if [[ "$DRY_RUN" == "true" ]]; then
         log_info "[DRY RUN] Would run: docker network prune -f"
     else
-        docker network prune -f >/dev/null 2>&1 || true
+        cleanup_networks
         log_success "Unused networks cleaned up"
     fi
 
     # Show Docker system disk usage
     log_info "Docker system disk usage:"
-    if has_command docker; then
+    if check_docker_available; then
         docker system df 2>/dev/null || log_warn "Could not get Docker disk usage"
     fi
 
@@ -358,8 +349,8 @@ show_disk_usage() {
         done
     fi
 
-    # Docker usage
-    if check_docker >/dev/null 2>&1; then
+    # Docker usage if available
+    if check_docker_available; then
         echo ""
         echo "Docker System Usage:"
         docker system df 2>/dev/null || echo "  Cannot determine Docker usage"
@@ -368,13 +359,56 @@ show_disk_usage() {
     echo ""
 }
 
+# --- Security Cleanup ---
+cleanup_security_logs() {
+    log_info "Cleaning security-related logs..."
+
+    # Clean fail2ban logs
+    local fail2ban_log="/var/log/fail2ban.log"
+    if [[ -f "$fail2ban_log" ]]; then
+        if [[ "$DRY_RUN" == "true" ]]; then
+            log_info "[DRY RUN] Would rotate fail2ban log"
+        else
+            # Rotate fail2ban log if it's large
+            local log_size
+            log_size=$(stat -c%s "$fail2ban_log" 2>/dev/null || echo "0")
+            if [[ $log_size -gt 10485760 ]]; then  # 10MB
+                mv "$fail2ban_log" "$fail2ban_log.old" 2>/dev/null || true
+                systemctl reload fail2ban 2>/dev/null || true
+                log_success "Rotated large fail2ban log"
+            fi
+        fi
+    fi
+
+    # Clean auth logs older than 30 days
+    local auth_log_dir="/var/log"
+    if [[ -d "$auth_log_dir" ]]; then
+        if [[ "$DRY_RUN" == "true" ]]; then
+            local old_auth_logs
+            old_auth_logs=$(find "$auth_log_dir" -name "auth.log.*" -mtime +30 2>/dev/null | wc -l)
+            log_info "[DRY RUN] Would remove $old_auth_logs old auth logs"
+        else
+            local removed_auth=0
+            while IFS= read -r -d '' auth_file; do
+                rm -f "$auth_file" && ((removed_auth++))
+            done < <(find "$auth_log_dir" -name "auth.log.*" -mtime +30 -print0 2>/dev/null)
+
+            if [[ $removed_auth -gt 0 ]]; then
+                log_success "Removed $removed_auth old auth logs"
+            fi
+        fi
+    fi
+
+    return 0
+}
+
 # --- Main Execution ---
 main() {
-    log_header "VaultWarden System Maintenance"
+    log_info "VaultWarden System Maintenance"
 
     validate_environment || exit 1
 
-    # Load configuration
+    # Load configuration using library function
     load_env_file 2>/dev/null || log_warn "No .env file found"
 
     # Show current disk usage
@@ -399,11 +433,13 @@ main() {
             cleanup_logs
             cleanup_backups  
             cleanup_docker
+            cleanup_security_logs
             ;;
         "deep")
             cleanup_logs
             cleanup_backups
             cleanup_docker
+            cleanup_security_logs
             cleanup_system
             ;;
         "docker")

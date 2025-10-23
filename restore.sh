@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# restore.sh - Simplified VaultWarden restore from backups
-# Replaces: Complex backup recovery system
+# restore.sh - Simplified VaultWarden restore with library integration
+# Uses centralized library functions
 
 set -euo pipefail
 
@@ -9,11 +9,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$SCRIPT_DIR"
 cd "$PROJECT_ROOT"
 
-# --- Simple Logging ---
-log_info() { echo "[$(date '+%H:%M:%S')] [INFO] $*"; }
-log_warn() { echo "[$(date '+%H:%M:%S')] [WARN] $*" >&2; }
-log_error() { echo "[$(date '+%H:%M:%S')] [ERROR] $*" >&2; }
-log_success() { echo "[$(date '+%H:%M:%S')] [SUCCESS] $*"; }
+# --- Source Libraries ---
+source "lib/common.sh"
+init_common_lib "$0"
+source "lib/docker.sh"
+source "lib/crypto.sh"
 
 # --- Configuration ---
 RESTORE_TYPE="auto"  # auto, db, full, emergency
@@ -46,12 +46,6 @@ EXAMPLES:
     ./restore.sh --type db db-backup.age     # Database restore
     ./restore.sh --force emergency-kit.age  # Force emergency restore
     ./restore.sh --dry-run backup.age       # Preview restore actions
-
-NOTES:
-    - Services will be stopped during restore
-    - Age private key must be available for decryption
-    - Database restores require VaultWarden to be stopped
-    - Full/emergency restores will overwrite existing configuration
 EOF
 }
 
@@ -71,22 +65,14 @@ done
 # --- Validation ---
 validate_environment() {
     # Check required commands
-    local missing=()
-    for cmd in age tar gzip docker; do
-        if ! command -v "$cmd" >/dev/null 2>&1; then
-            missing+=("$cmd")
-        fi
-    done
+    require_commands age tar gzip || return 1
 
-    if [[ ${#missing[@]} -gt 0 ]]; then
-        log_error "Missing required commands: ${missing[*]}"
-        return 1
-    fi
+    # Check Docker availability for container operations
+    require_docker || return 1
 
     # Check Age key
-    local age_key="secrets/keys/age-key.txt"
-    if [[ ! -f "$age_key" ]]; then
-        log_error "Age private key not found: $age_key"
+    if ! check_age_key; then
+        log_error "Age private key not available"
         log_info "Restore the Age key from your secure backup first"
         return 1
     fi
@@ -128,9 +114,8 @@ detect_backup_type() {
             # Try to peek inside the encrypted file to determine type
             log_info "Attempting to auto-detect backup type..."
 
-            # Decrypt and check for common files
-            if age -d -i secrets/keys/age-key.txt "$BACKUP_FILE" | tar -tf - 2>/dev/null | grep -q "docker-compose.yml\|RECOVERY.md"; then
-                if age -d -i secrets/keys/age-key.txt "$BACKUP_FILE" | tar -tf - 2>/dev/null | grep -q "RECOVERY.md\|kit-info.txt"; then
+            if decrypt_file "$BACKUP_FILE" | tar -tf - 2>/dev/null | grep -q "docker-compose.yml\|RECOVERY.md"; then
+                if decrypt_file "$BACKUP_FILE" | tar -tf - 2>/dev/null | grep -q "RECOVERY.md\|kit-info.txt"; then
                     echo "emergency"
                 else
                     echo "full"
@@ -211,13 +196,14 @@ restore_database() {
         return 0
     fi
 
-    # Stop VaultWarden service
+    # Stop VaultWarden service using library function
     log_info "Stopping VaultWarden service..."
-    docker compose stop vaultwarden || log_warn "Failed to stop VaultWarden (may not be running)"
+    stop_services "vaultwarden" || log_warn "VaultWarden may not have been running"
 
     # Backup current database
-    local state_dir="${PROJECT_STATE_DIR:-/var/lib/vaultwarden}"
-    local db_file="$state_dir/data/bwdata/db.sqlite3"
+    local state_dir db_file
+    state_dir=$(get_config_value "PROJECT_STATE_DIR" "/var/lib/vaultwarden")
+    db_file="$state_dir/data/bwdata/db.sqlite3"
 
     if [[ -f "$db_file" ]]; then
         log_info "Backing up current database..."
@@ -225,27 +211,26 @@ restore_database() {
     fi
 
     # Ensure database directory exists
-    mkdir -p "$(dirname "$db_file")"
+    ensure_dir "$(dirname "$db_file")" 755
 
-    # Decrypt and restore database
+    # Decrypt and restore database using library function
     log_info "Restoring database from backup..."
-    if age -d -i secrets/keys/age-key.txt "$BACKUP_FILE" | gunzip > "$db_file"; then
+    if decrypt_file "$BACKUP_FILE" | gunzip > "$db_file"; then
         log_success "Database restored successfully"
 
         # Set proper permissions
-        chmod 644 "$db_file"
+        secure_file "$db_file" 644
 
-        # Start VaultWarden service
+        # Start VaultWarden service using library function
         log_info "Starting VaultWarden service..."
-        if docker compose start vaultwarden; then
+        if start_services "vaultwarden"; then
             log_success "VaultWarden service started"
 
-            # Wait and check health
-            sleep 5
-            if docker compose ps vaultwarden --status running >/dev/null 2>&1; then
+            # Wait and check health using library function
+            if wait_for_service_ready "vaultwarden" 30; then
                 log_success "Database restore completed successfully"
             else
-                log_error "VaultWarden failed to start after restore"
+                log_error "VaultWarden failed to start properly after restore"
                 log_info "Check logs: docker compose logs vaultwarden"
                 return 1
             fi
@@ -272,18 +257,18 @@ restore_full_system() {
         return 0
     fi
 
-    # Stop all services
+    # Stop all services using library function
     log_info "Stopping all services..."
-    docker compose down || log_warn "Failed to stop services (may not be running)"
+    stop_services || log_warn "Services may not have been running"
 
     # Create temporary restore directory
     local temp_dir
     temp_dir=$(mktemp -d)
-    trap "rm -rf '$temp_dir'" EXIT
+    setup_cleanup_trap "rm -rf '$temp_dir'"
 
-    # Decrypt backup
+    # Decrypt backup using library function
     log_info "Decrypting backup archive..."
-    if ! age -d -i secrets/keys/age-key.txt "$BACKUP_FILE" | tar -xzf - -C "$temp_dir"; then
+    if ! decrypt_file "$BACKUP_FILE" | tar -xzf - -C "$temp_dir"; then
         log_error "Failed to decrypt or extract backup"
         return 1
     fi
@@ -306,10 +291,11 @@ restore_full_system() {
     [[ -d "$temp_dir/fail2ban" ]] && cp -r "$temp_dir/fail2ban" . || log_warn "fail2ban/ not found in backup"
 
     # Restore data directory
-    local state_dir="${PROJECT_STATE_DIR:-/var/lib/vaultwarden}"
+    local state_dir
+    state_dir=$(get_config_value "PROJECT_STATE_DIR" "/var/lib/vaultwarden")
     if [[ -d "$temp_dir/data" ]]; then
         log_info "Restoring data directory..."
-        mkdir -p "$state_dir"
+        ensure_dir "$state_dir" 755
 
         # Backup existing data
         [[ -d "$state_dir/data" ]] && mv "$state_dir/data" "$state_dir/data.$backup_suffix" || true
@@ -318,15 +304,34 @@ restore_full_system() {
         cp -r "$temp_dir/data" "$state_dir/" || log_warn "Failed to restore some data files"
     fi
 
-    # Set proper permissions
-    chmod 600 .env 2>/dev/null || true
-    chmod 600 secrets/secrets.yaml 2>/dev/null || true
-    chmod 600 secrets/keys/age-key.txt 2>/dev/null || true
+    # Set proper permissions using library functions
+    secure_file .env 600 2>/dev/null || true
+    secure_file secrets/secrets.yaml 600 2>/dev/null || true
+    secure_file secrets/keys/age-key.txt 600 2>/dev/null || true
 
-    # Start services
+    # Start services using library function
     log_info "Starting services..."
-    if ./startup.sh; then
-        log_success "Full system restore completed successfully"
+    if start_services; then
+        # Wait for services to be ready
+        log_info "Waiting for services to initialize..."
+        sleep 10
+
+        local critical_services=("vaultwarden" "caddy")
+        local failed_services=()
+
+        for service in "${critical_services[@]}"; do
+            if ! wait_for_service_ready "$service" 30; then
+                failed_services+=("$service")
+            fi
+        done
+
+        if [[ ${#failed_services[@]} -eq 0 ]]; then
+            log_success "Full system restore completed successfully"
+        else
+            log_error "Some services failed to start: ${failed_services[*]}"
+            log_info "Check logs and try: ./startup.sh --force-restart"
+            return 1
+        fi
     else
         log_error "Failed to start services after restore"
         log_info "Check configuration and try: ./startup.sh --force-restart"
@@ -342,22 +347,17 @@ restore_emergency_kit() {
 
     if [[ "$DRY_RUN" == "true" ]]; then
         log_info "[DRY RUN] Would perform complete system restoration from emergency kit"
-        log_info "[DRY RUN] Would decrypt kit and restore all components"
-        log_info "[DRY RUN] Would restart all services"
         return 0
     fi
-
-    # Emergency restore is essentially the same as full restore
-    # but with additional verification and documentation display
 
     # Create temporary restore directory
     local temp_dir
     temp_dir=$(mktemp -d)
-    trap "rm -rf '$temp_dir'" EXIT
+    setup_cleanup_trap "rm -rf '$temp_dir'"
 
-    # Decrypt emergency kit
+    # Decrypt emergency kit using library function
     log_info "Decrypting emergency kit..."
-    if ! age -d -i secrets/keys/age-key.txt "$BACKUP_FILE" | tar -xzf - -C "$temp_dir"; then
+    if ! decrypt_file "$BACKUP_FILE" | tar -xzf - -C "$temp_dir"; then
         log_error "Failed to decrypt or extract emergency kit"
         return 1
     fi
@@ -368,7 +368,7 @@ restore_emergency_kit() {
         echo ""
         head -20 "$temp_dir/RECOVERY.md"
         echo ""
-        log_info "Full recovery guide saved as: RECOVERY.md"
+        log_info "Full recovery guide will be saved as: RECOVERY.md"
         cp "$temp_dir/RECOVERY.md" .
     fi
 
@@ -378,16 +378,15 @@ restore_emergency_kit() {
         echo ""
     fi
 
-    # Perform full system restore using the same logic
-    # Stop services and restore everything
+    # Stop all services using library function
     log_info "Stopping all services..."
-    docker compose down || true
+    stop_services || true
 
-    # Backup current state
+    # Create emergency backup of current state
     local backup_suffix="emergency-backup-$(date +%Y%m%d-%H%M%S)"
     log_info "Creating emergency backup of current state..."
 
-    mkdir -p "emergency-backups/$backup_suffix"
+    ensure_dir "emergency-backups/$backup_suffix" 755
     cp -r . "emergency-backups/$backup_suffix/" 2>/dev/null || true
 
     # Restore all components
@@ -401,23 +400,43 @@ restore_emergency_kit() {
     [[ -d "$temp_dir/fail2ban" ]] && cp -r "$temp_dir/fail2ban" .
 
     # Data directory
-    local state_dir="${PROJECT_STATE_DIR:-/var/lib/vaultwarden}"
+    local state_dir
+    state_dir=$(get_config_value "PROJECT_STATE_DIR" "/var/lib/vaultwarden")
     if [[ -d "$temp_dir/data" ]]; then
-        mkdir -p "$state_dir"
+        ensure_dir "$state_dir" 755
         rm -rf "$state_dir/data" 2>/dev/null || true
         cp -r "$temp_dir/data" "$state_dir/"
     fi
 
-    # Set permissions
-    chmod 600 .env secrets/secrets.yaml secrets/keys/age-key.txt 2>/dev/null || true
+    # Set permissions using library functions
+    secure_file .env 600 2>/dev/null || true
+    secure_file secrets/secrets.yaml 600 2>/dev/null || true
+    secure_file secrets/keys/age-key.txt 600 2>/dev/null || true
 
-    # Start services
+    # Start services using library function
     log_info "Starting restored services..."
-    if ./startup.sh; then
-        log_success "Emergency kit restore completed successfully"
-        echo ""
-        log_info "System restored from emergency kit"
-        log_info "Verify functionality and update DNS if needed"
+    if start_services; then
+        log_info "Waiting for services to initialize..."
+        sleep 15
+
+        local critical_services=("vaultwarden" "caddy")
+        local ready_services=0
+
+        for service in "${critical_services[@]}"; do
+            if wait_for_service_ready "$service" 45; then
+                ((ready_services++))
+            fi
+        done
+
+        if [[ $ready_services -eq ${#critical_services[@]} ]]; then
+            log_success "Emergency kit restore completed successfully"
+            echo ""
+            log_info "System restored from emergency kit"
+            log_info "Verify functionality and update DNS if needed"
+        else
+            log_error "Some services failed to start properly after emergency restore"
+            return 1
+        fi
     else
         log_error "Failed to start services after emergency restore"
         return 1
@@ -442,11 +461,7 @@ main() {
     confirm_restore "$RESTORE_TYPE"
 
     # Load configuration if available
-    if [[ -f .env ]]; then
-        set -a
-        source .env
-        set +a
-    fi
+    load_env_file 2>/dev/null || log_warn "No .env file found"
 
     # Perform restore based on type
     case "$RESTORE_TYPE" in
@@ -466,12 +481,15 @@ main() {
             ;;
     esac
 
+    local domain
+    domain=$(get_config_value "DOMAIN" "your-domain")
+
     echo ""
     log_success "Restore operation completed successfully!"
     echo ""
     echo "Next steps:"
     echo "  1. Verify service health: ./health.sh"
-    echo "  2. Test web access: https://\${DOMAIN:-your-domain}"
+    echo "  2. Test web access: https://$domain"
     echo "  3. Check admin panel access"
     echo "  4. Create new backup: ./backup.sh"
 }

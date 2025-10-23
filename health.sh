@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# health.sh - Simplified VaultWarden health monitoring and auto-repair
-# Replaces: Complex monitoring library with self-healing
+# health.sh - Simplified VaultWarden health monitoring with library integration
+# Uses centralized library functions
 
 set -euo pipefail
 
@@ -9,11 +9,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$SCRIPT_DIR"
 cd "$PROJECT_ROOT"
 
-# --- Simple Logging ---
-log_info() { echo "[$(date '+%H:%M:%S')] [INFO] $*"; }
-log_warn() { echo "[$(date '+%H:%M:%S')] [WARN] $*" >&2; }
-log_error() { echo "[$(date '+%H:%M:%S')] [ERROR] $*" >&2; }
-log_success() { echo "[$(date '+%H:%M:%S')] [SUCCESS] $*"; }
+# --- Source Libraries ---
+source "lib/common.sh"
+init_common_lib "$0"
+source "lib/docker.sh"
+source "lib/crypto.sh"
 
 # --- Configuration ---
 COMPREHENSIVE=false
@@ -56,7 +56,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# --- Utility Functions ---
+# --- Health Check Functions ---
 check_pass() {
     [[ "$QUIET" != "true" ]] && log_success "✅ $*"
 }
@@ -71,32 +71,17 @@ check_fail() {
     ((ERRORS++))
 }
 
-# --- Load Configuration ---
-load_config() {
-    if [[ -f .env ]]; then
-        set -a
-        source .env
-        set +a
-        return 0
-    else
-        check_fail "Configuration file .env not found"
-        return 1
-    fi
-}
-
-# --- Docker Health Checks ---
+# --- Core Health Checks ---
 check_docker_health() {
     [[ "$QUIET" != "true" ]] && log_info "Checking Docker health..."
 
-    # Check Docker daemon
-    if ! docker info >/dev/null 2>&1; then
+    if ! check_docker_available; then
         check_fail "Docker daemon not accessible"
         return 1
     fi
     check_pass "Docker daemon accessible"
 
-    # Check Docker Compose
-    if ! docker compose version >/dev/null 2>&1; then
+    if ! check_compose_available; then
         check_fail "Docker Compose not available"
         return 1
     fi
@@ -105,7 +90,6 @@ check_docker_health() {
     return 0
 }
 
-# --- Container Health Checks ---
 check_container_health() {
     [[ "$QUIET" != "true" ]] && log_info "Checking container health..."
 
@@ -114,15 +98,12 @@ check_container_health() {
     local stopped_services=()
 
     for service in "${services[@]}"; do
-        local status
-        status=$(docker compose ps "$service" --format json 2>/dev/null | jq -r '.State // "unknown"' 2>/dev/null || echo "unknown")
+        local status health
+        status=$(get_service_status "$service")
+        health=$(get_service_health "$service")
 
         case "$status" in
             "running")
-                # Check health status if available
-                local health
-                health=$(docker compose ps "$service" --format json 2>/dev/null | jq -r '.Health // "none"' 2>/dev/null || echo "none")
-
                 if [[ "$health" == "unhealthy" ]]; then
                     unhealthy_services+=("$service")
                     check_fail "$service is running but unhealthy"
@@ -132,13 +113,9 @@ check_container_health() {
                     check_pass "$service is running and healthy"
                 fi
                 ;;
-            "exited"|"dead")
+            "exited"|"dead"|"not_found")
                 stopped_services+=("$service")
-                check_fail "$service is stopped"
-                ;;
-            "unknown")
-                stopped_services+=("$service")
-                check_fail "$service status unknown (not found)"
+                check_fail "$service is not running"
                 ;;
             *)
                 check_warn "$service in unexpected state: $status"
@@ -156,12 +133,11 @@ check_container_health() {
     fi
 }
 
-# --- System Resource Checks ---
 check_system_resources() {
     [[ "$QUIET" != "true" ]] && log_info "Checking system resources..."
 
     # Memory usage
-    if command -v free >/dev/null; then
+    if has_command free; then
         local mem_percent
         mem_percent=$(free | awk '/^Mem:/ {printf "%.0f", ($3/$2)*100}')
 
@@ -174,8 +150,9 @@ check_system_resources() {
         fi
     fi
 
-    # Disk usage for project state directory
-    local state_dir="${PROJECT_STATE_DIR:-/var/lib/vaultwarden}"
+    # Disk usage
+    local state_dir
+    state_dir=$(get_config_value "PROJECT_STATE_DIR" "/var/lib/vaultwarden")
     if [[ -d "$state_dir" ]]; then
         local disk_percent
         disk_percent=$(df -h "$state_dir" | awk 'NR==2{print $5}' | sed 's/%//')
@@ -192,12 +169,11 @@ check_system_resources() {
     return 0
 }
 
-# --- Network Connectivity Checks ---
 check_network_health() {
     [[ "$QUIET" != "true" ]] && log_info "Checking network connectivity..."
 
     # Internet connectivity
-    if ping -c 1 -W 5 1.1.1.1 >/dev/null 2>&1; then
+    if test_connectivity; then
         check_pass "Internet connectivity working"
     else
         check_fail "No internet connectivity"
@@ -205,12 +181,14 @@ check_network_health() {
     fi
 
     # Domain connectivity (if configured)
-    if [[ -n "${DOMAIN:-}" ]]; then
+    local domain
+    domain=$(get_config_value "DOMAIN" "")
+    if [[ -n "$domain" ]]; then
         local clean_domain
-        clean_domain=$(echo "$DOMAIN" | sed 's|https\?://||; s|/.*$||')
+        clean_domain=$(echo "$domain" | sed 's|https\?://||; s|/.*$||')
 
         # DNS resolution
-        if getent hosts "$clean_domain" >/dev/null 2>&1; then
+        if has_command getent && getent hosts "$clean_domain" >/dev/null 2>&1; then
             check_pass "DNS resolution for $clean_domain"
         else
             check_fail "DNS resolution failed for $clean_domain"
@@ -218,25 +196,21 @@ check_network_health() {
         fi
 
         # HTTPS connectivity
-        if command -v curl >/dev/null; then
-            if curl -sf --max-time 10 "https://$clean_domain" >/dev/null 2>&1; then
-                check_pass "HTTPS connectivity to $clean_domain"
-            else
-                check_warn "HTTPS connectivity failed to $clean_domain"
-            fi
+        if test_http "https://$clean_domain" 10; then
+            check_pass "HTTPS connectivity to $clean_domain"
+        else
+            check_warn "HTTPS connectivity failed to $clean_domain"
         fi
     fi
 
     return 0
 }
 
-# --- Backup Health Checks ---
 check_backup_health() {
     [[ "$QUIET" != "true" ]] && log_info "Checking backup health..."
 
     local backup_dir="$PROJECT_ROOT/backups"
 
-    # Check if backup directory exists
     if [[ ! -d "$backup_dir" ]]; then
         check_warn "Backup directory not found: $backup_dir"
         return 1
@@ -255,43 +229,88 @@ check_backup_health() {
     return 0
 }
 
+check_secrets_health() {
+    [[ "$QUIET" != "true" ]] && log_info "Checking secrets health..."
+
+    # Check Age key
+    if check_age_key; then
+        check_pass "Age encryption key accessible and secure"
+    else
+        check_fail "Age encryption key missing or insecure"
+        return 1
+    fi
+
+    # Check secrets file
+    if [[ -f "secrets/secrets.yaml" ]]; then
+        if is_sops_encrypted "secrets/secrets.yaml"; then
+            check_pass "Secrets file encrypted with SOPS"
+
+            # Test decryption
+            if get_secret "admin_token" >/dev/null 2>&1; then
+                check_pass "Secrets decryption working"
+            else
+                check_fail "Cannot decrypt secrets file"
+                return 1
+            fi
+        else
+            check_fail "Secrets file exists but not encrypted"
+            return 1
+        fi
+    else
+        check_warn "Secrets file not found"
+    fi
+
+    return 0
+}
+
 # --- Auto-Healing Functions ---
 auto_heal_containers() {
     log_info "Attempting to heal container issues..."
 
-    # Try restarting unhealthy containers first
+    # Get list of services that need healing
     local services=("vaultwarden" "caddy" "fail2ban")
-    local restart_needed=()
+    local services_to_heal=()
 
     for service in "${services[@]}"; do
-        local status health
-        status=$(docker compose ps "$service" --format json 2>/dev/null | jq -r '.State // "unknown"' 2>/dev/null || echo "unknown")
-        health=$(docker compose ps "$service" --format json 2>/dev/null | jq -r '.Health // "none"' 2>/dev/null || echo "none")
-
-        if [[ "$status" != "running" || "$health" == "unhealthy" ]]; then
-            restart_needed+=("$service")
+        if ! is_service_healthy "$service"; then
+            services_to_heal+=("$service")
         fi
     done
 
-    if [[ ${#restart_needed[@]} -gt 0 ]]; then
-        log_info "Restarting services: ${restart_needed[*]}"
+    if [[ ${#services_to_heal[@]} -gt 0 ]]; then
+        log_info "Healing services: ${services_to_heal[*]}"
 
-        if docker compose restart "${restart_needed[@]}"; then
+        # Try restart first
+        if restart_services "${services_to_heal[@]}"; then
             log_success "Services restarted successfully"
             sleep 10  # Wait for services to initialize
-            return 0
-        else
-            log_error "Failed to restart services"
 
-            # If restart failed, try full recreate
-            log_info "Attempting full service recreation..."
-            if ./startup.sh --force-restart; then
-                log_success "Services recreated successfully"
+            # Check if healing worked
+            local still_unhealthy=()
+            for service in "${services_to_heal[@]}"; do
+                if ! wait_for_service_ready "$service" 30; then
+                    still_unhealthy+=("$service")
+                fi
+            done
+
+            if [[ ${#still_unhealthy[@]} -eq 0 ]]; then
                 return 0
             else
-                log_error "Auto-healing failed"
-                return 1
+                log_warn "Restart failed for: ${still_unhealthy[*]}, trying recreate..."
+
+                # If restart failed, try full recreate
+                if recreate_services "${still_unhealthy[@]}"; then
+                    log_success "Services recreated successfully"
+                    sleep 15  # Longer wait after recreate
+                    return 0
+                else
+                    log_error "Auto-healing failed"
+                    return 1
+                fi
             fi
+        else
+            log_error "Failed to restart services"
+            return 1
         fi
     else
         log_info "No container healing needed"
@@ -304,7 +323,8 @@ run_health_checks() {
     log_info "Running VaultWarden health checks..."
     echo ""
 
-    load_config || return 1
+    # Load configuration
+    load_env_file 2>/dev/null || log_warn "No .env file found, using defaults"
 
     # Core checks
     check_docker_health || return 1
@@ -316,6 +336,7 @@ run_health_checks() {
         check_system_resources
         check_network_health
         check_backup_health
+        check_secrets_health
     fi
 
     # Auto-heal if requested and issues found
