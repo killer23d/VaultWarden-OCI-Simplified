@@ -1,0 +1,222 @@
+version: "3.9"
+
+secrets:
+  admin_token:
+    file: ./secrets/.docker_secrets/admin_token
+  smtp_password:
+    file: ./secrets/.docker_secrets/smtp_password
+  backup_passphrase:
+    file: ./secrets/.docker_secrets/backup_passphrase
+  push_installation_key:
+    file: ./secrets/.docker_secrets/push_installation_key
+  cloudflare_api_token:
+    file: ./secrets/.docker_secrets/cloudflare_api_token
+
+services:
+  vaultwarden:
+    image: vaultwarden/server:1.30.5
+    container_name: ${COMPOSE_PROJECT_NAME:-vaultwarden}_vaultwarden
+    user: "1000:1000"  # Run as non-root user
+    restart: unless-stopped
+    expose:
+      - 8080 # Main API/UI
+      - 3012 # WebSockets
+    environment:
+      # DOMAIN variable should contain the full protocol and domain (e.g., https://vault.example.com)
+      # This is automatically constructed by Vaultwarden from the bare DOMAIN var passed to compose.
+      # We still need to pass the bare DOMAIN here for Caddy.
+      - DOMAIN=https://${DOMAIN} # Vaultwarden expects full URL
+      - ROCKET_PORT=8080
+      - WEBSOCKET_ENABLED=${WEBSOCKET_ENABLED:-true}
+      - WEBSOCKET_ADDRESS=0.0.0.0
+      - WEBSOCKET_PORT=3012
+      - DATABASE_URL=${DATABASE_URL:-sqlite:///data/db.sqlite3}
+      - SIGNUPS_ALLOWED=${SIGNUPS_ALLOWED:-false}
+      - INVITATIONS_ALLOWED=${INVITATIONS_ALLOWED:-true}
+      - SMTP_HOST=${SMTP_HOST}
+      - SMTP_FROM=${SMTP_FROM}
+      - SMTP_PORT=${SMTP_PORT:-587}
+      - SMTP_SECURITY=${SMTP_SECURITY:-starttls}
+      - SMTP_USERNAME=${SMTP_USERNAME}
+      - PUSH_ENABLED=${PUSH_ENABLED:-false}
+      - PUSH_INSTALLATION_ID=${PUSH_INSTALLATION_ID}
+      - PUSH_RELAY_URI=${PUSH_RELAY_URI:-https://api.bitwarden.com}
+      - LOG_FILE=/data/vaultwarden.log
+      - LOG_LEVEL=${LOG_LEVEL:-warn}
+      - EXTENDED_LOGGING=${EXTENDED_LOGGING:-true}
+      - TZ=${TZ:-UTC}
+      - ADMIN_TOKEN_FILE=/run/secrets/admin_token
+      - SMTP_PASSWORD_FILE=/run/secrets/smtp_password
+      - PUSH_INSTALLATION_KEY_FILE=/run/secrets/push_installation_key
+    secrets:
+      - admin_token
+      - smtp_password
+      - push_installation_key
+    volumes:
+      # Mount the persistent data directory
+      - ${PROJECT_STATE_DIR:-/var/lib/vaultwarden}/data/bwdata:/data
+    deploy:
+      resources:
+        limits:
+          memory: ${VAULTWARDEN_MEMORY_LIMIT:-1.5G}
+          cpus: '0.75' # Allow VW slightly more CPU, main workload
+        reservations:
+          memory: ${VAULTWARDEN_MEMORY_RESERVATION:-256M}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/alive"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+
+  caddy:
+    image: caddy:2.7.6
+    container_name: ${CONTAINER_NAME_CADDY:-${COMPOSE_PROJECT_NAME}_caddy}
+    user: "1000:1000"  # Run as non-root user
+    restart: unless-stopped
+    ports: ["80:80", "443:443", "443:443/udp"]
+    environment:
+      # Pass the BARE domain (e.g., vault.example.com) to Caddy
+      - DOMAIN=${DOMAIN}
+      - ADMIN_EMAIL=${ADMIN_EMAIL}
+      - ADMIN_BASIC_AUTH_HASH=${ADMIN_BASIC_AUTH_HASH}
+      - TZ=${TZ:-UTC}
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./caddy/cloudflare-ips.caddy:/etc/caddy/cloudflare-ips.caddy:ro
+      - caddy_data:/data # Persistent volume for certificates etc.
+      - caddy_config:/config # Persistent volume for Caddy config state
+      # Mount log directory
+      - ${PROJECT_STATE_DIR:-/var/lib/vaultwarden}/logs/caddy:/var/log/caddy
+    depends_on:
+      vaultwarden:
+        condition: service_healthy # Wait for vaultwarden to be healthy
+    deploy:
+      resources:
+        limits:
+          memory: ${CADDY_MEMORY_LIMIT:-384M}
+          cpus: '0.25' # Caddy is generally lightweight
+        reservations:
+          memory: ${CADDY_MEMORY_RESERVATION:-64M}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+
+  fail2ban:
+    image: lscr.io/linuxserver/fail2ban:1.1.0
+    container_name: ${CONTAINER_NAME_FAIL2BAN:-${COMPOSE_PROJECT_NAME}_fail2ban}
+    restart: unless-stopped
+    network_mode: host # Needs host network to modify iptables
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW # Required capabilities for iptables
+    # NOTE: fail2ban must run as root for iptables access - user directive omitted intentionally
+    environment:
+      - PUID=0
+      - PGID=0
+      - TZ=${TZ:-UTC}
+    volumes:
+      - ./fail2ban:/config:ro # Mount custom config, filters, actions
+      # Mount log directory for fail2ban's own logs
+      - ${PROJECT_STATE_DIR:-/var/lib/vaultwarden}/logs/fail2ban:/var/log/fail2ban
+      # Mount Caddy logs read-only for fail2ban to parse
+      - ${PROJECT_STATE_DIR:-/var/lib/vaultwarden}/logs/caddy:/var/log/caddy:ro
+      # Mount Vaultwarden log file read-only (it resides within the bwdata volume)
+      - ${PROJECT_STATE_DIR:-/var/lib/vaultwarden}/data/bwdata:/var/log/vaultwarden:ro
+      # Mount host auth log for SSH protection
+      - /var/log/auth.log:/var/log/auth.log:ro
+      # Mount host localtime
+      - /etc/localtime:/etc/localtime:ro
+    deploy:
+      resources:
+        limits:
+          memory: ${FAIL2BAN_MEMORY_LIMIT:-192M}
+          cpus: '0.2' # Fail2ban can spike but usually low average
+        reservations:
+          memory: ${FAIL2BAN_MEMORY_RESERVATION:-64M}
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+
+  watchtower:
+    image: containrrr/watchtower:1.6.0
+    container_name: ${CONTAINER_NAME_WATCHTOWER:-${COMPOSE_PROJECT_NAME}_watchtower}
+    # Keep stopped unless run via cron/timer
+    # restart: unless-stopped # Remove this if using external runner
+    # Command runs once, checks labeled containers, sends email, cleans up old images
+    command: --monitor-only --run-once --cleanup --label-enable --include-restarting --debug
+    environment:
+      - TZ=${TZ:-UTC}
+      - WATCHTOWER_NOTIFICATIONS=email
+      - WATCHTOWER_NOTIFICATION_EMAIL_FROM=${SMTP_FROM}
+      - WATCHTOWER_NOTIFICATION_EMAIL_TO=${ADMIN_EMAIL}
+      - WATCHTOWER_NOTIFICATION_EMAIL_SERVER=${SMTP_HOST}
+      - WATCHTOWER_NOTIFICATION_EMAIL_SERVER_PORT=${SMTP_PORT:-587}
+      - WATCHTOWER_NOTIFICATION_EMAIL_SERVER_USER=${SMTP_USERNAME}
+      - WATCHTOWER_NOTIFICATION_EMAIL_SERVER_PASSWORD_FILE=/run/secrets/smtp_password
+      - WATCHTOWER_NOTIFICATION_EMAIL_SUBJECTTAG="[Vaultwarden Watchtower]"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    secrets:
+      - smtp_password # Needed for email notifications
+    deploy:
+      resources:
+        limits:
+          memory: ${WATCHTOWER_MEMORY_LIMIT:-128M}
+          cpus: '0.1' # Very low usage usually
+        reservations:
+          memory: ${WATCHTOWER_MEMORY_RESERVATION:-32M}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
+    # No watchtower label needed if run via external schedule
+
+  ddclient:
+    # Optional service - Starts only if DDCLIENT_ENABLED=true and vars are set.
+    # Docker compose doesn't have native conditional service startup based on env vars,
+    # so this service definition is always present. The startup script handles rendering
+    # the config file only if enabled. If disabled, the container might start but do nothing.
+    image: lscr.io/linuxserver/ddclient:3.11.2
+    container_name: ${CONTAINER_NAME_DDCLIENT:-${COMPOSE_PROJECT_NAME}_ddclient}
+    restart: unless-stopped
+    environment:
+      - PUID=1000  # Run as non-root user
+      - PGID=1000
+      - TZ=${TZ:-UTC}
+    volumes:
+      # Mount the rendered config file. If DDCLIENT_ENABLED=false, this file might not exist
+      # or be empty, depending on startup script logic. ddclient should handle this gracefully.
+      - ./ddclient/ddclient.conf:/config/ddclient.conf:ro
+    deploy:
+      resources:
+        limits:
+          memory: ${DDCLIENT_MEMORY_LIMIT:-64M}
+          cpus: '0.1' # Very low usage
+        reservations:
+          memory: ${DDCLIENT_MEMORY_RESERVATION:-16M}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true" # Monitor ddclient image
+
+# Define persistent named volumes for Caddy
+volumes:
+  caddy_data:
+  caddy_config:
+
+# Note: Vaultwarden data is stored in a bind mount defined by PROJECT_STATE_DIR
