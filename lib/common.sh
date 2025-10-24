@@ -267,6 +267,57 @@ test_http() {
     fi
 }
 
+# --- START P1/P2: New Email Notification Function ---
+# Send notification email with rate limiting
+# Usage: send_notification_email "Subject" "Body"
+send_notification_email() {
+    local subject="$1"
+    local body="$2"
+    
+    local admin_email
+    admin_email=$(get_config_value "ADMIN_EMAIL" "")
+    
+    if [[ -z "$admin_email" ]]; then
+        log_warn "ADMIN_EMAIL not configured. Cannot send notification."
+        return 1
+    fi
+    
+    if ! has_command mail; then
+        log_warn "mail command (mailutils) not available. Cannot send notification."
+        return 1
+    fi
+    
+    # --- Start User Suggestion: Rate Limiting ---
+    local last_email_file="/tmp/.vw_last_email_$(echo "$subject" | md5sum | cut -d' ' -f1)"
+    if [[ -f "$last_email_file" ]]; then
+        local last_time current_time
+        last_time=$(cat "$last_email_file")
+        current_time=$(date +%s)
+        
+        # Don't send the same subject email more than once per hour
+        if (( current_time - last_time < 3600 )); then
+            log_debug "Email rate limited, skipping notification"
+            return 0
+        fi
+    fi
+    echo "$(date +%s)" > "$last_email_file"
+    # --- End User Suggestion ---
+
+    local full_subject="[VaultWarden] $subject"
+    local full_body="$body
+---
+Host: $(hostname -f 2>/dev/null || hostname)
+Timestamp: $(date -uIs)"
+
+    if echo "$full_body" | mail -s "$full_subject" "$admin_email"; then
+        log_success "Notification email sent to $admin_email"
+    else
+        log_error "Failed to send notification email"
+        return 1
+    fi
+}
+# --- END P1/P2 ---
+
 # --- Validation Helpers ---
 
 # Validate email format (basic)
@@ -322,6 +373,7 @@ export -f log_info log_success log_warn log_error log_debug log_header set_log_p
 export -f load_env_file get_config_value require_config
 export -f has_command require_commands is_root get_real_user
 export -f ensure_dir secure_file test_connectivity test_http
+export -f send_notification_email
 export -f validate_email validate_domain setup_error_trap setup_cleanup_trap
 export -f init_common_lib
 
