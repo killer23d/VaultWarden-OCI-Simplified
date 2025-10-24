@@ -3,6 +3,7 @@
 # Uses centralized library functions
 
 set -euo pipefail
+trap "rm -rf '$PROJECT_ROOT/secrets/.docker_secrets' '$PROJECT_ROOT/.env.secrets' 2>/dev/null" EXIT HUP INT TERM
 
 # --- Project Root Resolution ---
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
