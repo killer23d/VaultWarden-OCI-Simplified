@@ -41,6 +41,10 @@ UPDATE TYPES:
     system        Update system packages (requires reboot)
     all           Update both containers and system
 
+NOTE:
+    To upgrade container versions (e.g., Vaultwarden 1.30.5 -> 1.31.0),
+    you must first edit the version tags in the .env file, then run this script.
+
 EXAMPLES:
     ./update.sh                     # Update containers with backup
     ./update.sh --type system      # Update system packages
