@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 # startup.sh - Simplified VaultWarden stack orchestration
-# Uses centralized library functions
 
 set -euo pipefail
 trap "rm -rf '$PROJECT_ROOT/secrets/.docker_secrets' '$PROJECT_ROOT/.env.secrets' 2>/dev/null" EXIT HUP INT TERM
@@ -81,7 +80,8 @@ prepare_docker_secrets() {
     fi
 
     # Get all secrets and create individual files
-    local secrets=("admin_token" "smtp_password" "push_installation_key")
+    # --- FIX (C2): Add cloudflare_api_token to the list ---
+    local secrets=("admin_token" "smtp_password" "push_installation_key" "cloudflare_api_token")
 
     for secret in "${secrets[@]}"; do
         local value
@@ -148,14 +148,16 @@ post_startup_health_check() {
     log_info "Performing post-startup health check..."
 
     # Wait for services to initialize
-    sleep 10
+    log_info "Waiting 15s for services to initialize..."
+    sleep 15
 
     # Check critical services
     local critical_services=("vaultwarden" "caddy")
     local failed_services=()
 
     for service in "${critical_services[@]}"; do
-        if ! wait_for_service_ready "$service" 30; then
+        # Use longer timeout for health check
+        if ! wait_for_service_ready "$service" 60; then
             failed_services+=("$service")
         fi
     done
