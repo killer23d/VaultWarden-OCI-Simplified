@@ -110,9 +110,9 @@ init_secrets() {
 # Generate with: openssl rand -hex 32
 admin_token: $admin_token
 
-# Basic auth hash for admin panel protection  
+# Basic auth hash for admin panel protection
 # Generate with: echo -n 'password' | argon2 \$(openssl rand -base64 32) -e -id -k 65536 -t 3 -p 4
-# Or use online bcrypt generator
+# Or use online bcrypt generator: https://bcrypt-generator.com/
 admin_basic_auth_hash: CHANGE_ME_BCRYPT_HASH
 
 # SMTP password for email notifications
@@ -121,11 +121,14 @@ smtp_password: CHANGE_ME_SMTP_PASSWORD
 # Backup encryption passphrase
 backup_passphrase: $backup_pass
 
-# Push notifications (optional)
+# Optional: Push notifications (get ID and Key from bitwarden.com/host)
+# --- FIX: Added push_installation_id ---
+push_installation_id: CHANGE_ME_OR_LEAVE_EMPTY
 push_installation_key: CHANGE_ME_OR_LEAVE_EMPTY
 
-# Cloudflare API token (optional)
-cloudflare_api_token: CHANGE_ME_OR_LEAVE_EMPTY
+# Optional: Cloudflare API token (for DNS challenges and Fail2Ban)
+# Create a scoped token: Zone:Zone:Read, Zone:DNS:Edit, Zone:Firewall Services:Edit
+cloudflare_api_token: CHANGE_ME_CLOUDFLARE_API_TOKEN
 EOF
 
     log_success "Template secrets file created"
@@ -142,9 +145,10 @@ EOF
 
     log_warn "IMPORTANT: Update the CHANGE_ME values:"
     log_info "  1. Run: ./edit-secrets.sh"
-    log_info "  2. Update admin_basic_auth_hash (use bcrypt generator)"
-    log_info "  3. Update smtp_password if using email notifications"
-    log_info "  4. Update other values as needed"
+    log_info "  2. Update admin_basic_auth_hash"
+    log_info "  3. Update cloudflare_api_token"
+    log_info "  4. Update smtp_password if using email notifications"
+    log_info "  5. Update push_installation_id and push_installation_key if using push"
 
     return 0
 }
