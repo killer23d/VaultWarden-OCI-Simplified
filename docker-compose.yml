@@ -1,7 +1,7 @@
 version: "3.9"
 
 # VaultWarden-OCI-NG Docker Compose Configuration
-# Simplified and optimized for small teams
+# Corrected version addressing v4 review feedback
 
 services:
   vaultwarden:
@@ -14,6 +14,13 @@ services:
       - DOMAIN=https://${DOMAIN}
       - DATABASE_URL=sqlite:///data/bwdata/db.sqlite3
       - ADMIN_TOKEN_FILE=/run/secrets/admin_token
+
+      # WebSocket Configuration (Addresses v4 review)
+      - WEBSOCKET_ENABLED=true
+      - WEBSOCKET_ADDRESS=0.0.0.0
+      - WEBSOCKET_PORT=3012
+
+      # SMTP Configuration
       - SMTP_HOST=${SMTP_HOST:-}
       - SMTP_PORT=${SMTP_PORT:-587}
       - SMTP_SECURITY=${SMTP_SECURITY:-starttls}
@@ -21,7 +28,19 @@ services:
       - SMTP_PASSWORD_FILE=/run/secrets/smtp_password
       - SMTP_FROM=${ADMIN_EMAIL}
       - SMTP_FROM_NAME=VaultWarden
+
+      # Push Notifications
       - PUSH_INSTALLATION_KEY_FILE=/run/secrets/push_installation_key
+
+      # Security Settings
+      - SIGNUPS_ALLOWED=false
+      - SIGNUPS_VERIFY=true
+      - INVITATIONS_ALLOWED=true
+      - EMERGENCY_ACCESS_ALLOWED=true
+      - SENDS_ALLOWED=true
+      - WEB_VAULT_ENABLED=true
+
+      # Logging Configuration
       - LOG_LEVEL=${VAULTWARDEN_LOG_LEVEL:-info}
       - EXTENDED_LOGGING=true
       - LOG_FILE=/logs/vaultwarden.log
@@ -54,10 +73,9 @@ services:
 
     networks:
       - vaultwarden_network
-      - caddy_network
 
   caddy:
-    image: caddy:${CADDY_VERSION:-2.7.6}
+    image: caddy:${CADDY_VERSION:-2.8.4}
     container_name: vaultwarden_caddy
     restart: unless-stopped
     user: "1000:1000"
@@ -66,7 +84,7 @@ services:
       - DOMAIN=${DOMAIN}
       - EMAIL=${ADMIN_EMAIL}
       - ADMIN_BASIC_AUTH_HASH=${ADMIN_BASIC_AUTH_HASH}
-      - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN:-}
+      - CLOUDFLARE_API_TOKEN_FILE=/run/secrets/cloudflare_api_token
 
     ports:
       - "80:80"
@@ -78,6 +96,10 @@ services:
       - ${PROJECT_STATE_DIR:-/var/lib/vaultwarden}/caddy/data:/data:rw
       - ${PROJECT_STATE_DIR:-/var/lib/vaultwarden}/caddy/config:/config:rw
       - ${PROJECT_STATE_DIR:-/var/lib/vaultwarden}/logs/caddy:/logs:rw
+
+    secrets:
+      - cloudflare_api_token
+      - admin_basic_auth_hash
 
     depends_on:
       vaultwarden:
@@ -100,7 +122,7 @@ services:
           cpus: '0.05'
 
     networks:
-      - caddy_network
+      - vaultwarden_network
 
   fail2ban:
     image: crazymax/fail2ban:${FAIL2BAN_VERSION:-1.1.0}
@@ -111,9 +133,14 @@ services:
       - TZ=UTC
       - F2B_LOG_LEVEL=${FAIL2BAN_LOG_LEVEL:-INFO}
       - F2B_LOG_TARGET=/var/log/fail2ban.log
+      - F2B_DB_PURGE_AGE=1d
+      - F2B_MAX_RETRY=3
+      - F2B_DEST_EMAIL=${ADMIN_EMAIL}
 
     volumes:
-      - ./fail2ban:/config:ro
+      - ./fail2ban/jail.d:/config/jail.d:ro
+      - ./fail2ban/filter.d:/config/filter.d:ro
+      - ./fail2ban/action.d:/config/action.d:ro
       - ${PROJECT_STATE_DIR:-/var/lib/vaultwarden}/logs/caddy:/var/log/caddy:ro
       - ${PROJECT_STATE_DIR:-/var/lib/vaultwarden}/logs/vaultwarden:/var/log/vaultwarden:ro
       - ${PROJECT_STATE_DIR:-/var/lib/vaultwarden}/logs/fail2ban:/var/log:rw
@@ -144,10 +171,14 @@ services:
 secrets:
   admin_token:
     file: ./secrets/.docker_secrets/admin_token
+  admin_basic_auth_hash:
+    file: ./secrets/.docker_secrets/admin_basic_auth_hash
   smtp_password:
     file: ./secrets/.docker_secrets/smtp_password
   push_installation_key:
     file: ./secrets/.docker_secrets/push_installation_key
+  cloudflare_api_token:
+    file: ./secrets/.docker_secrets/cloudflare_api_token
 
 # Network configuration
 networks:
@@ -157,10 +188,3 @@ networks:
     ipam:
       config:
         - subnet: 172.20.0.0/16
-
-  caddy_network:
-    name: caddy_network
-    driver: bridge
-    ipam:
-      config:
-        - subnet: 172.21.0.0/16
