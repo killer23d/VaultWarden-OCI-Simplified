@@ -33,12 +33,12 @@ OPTIONS:
     --type TYPE        Update type: containers, system, all (default: containers)
     --no-backup       Skip automatic backup before update
     --dry-run         Show what would be updated without executing
-    --force           Skip confirmation prompts
+    --force           Skip confirmation prompts (and auto-reboot if required)
     --help            Show this help
 
 UPDATE TYPES:
     containers    Update Docker containers only (safe, fast)
-    system        Update system packages (requires reboot)
+    system        Update system packages (will auto-reboot if needed with --force)
     all           Update both containers and system
 
 NOTE:
@@ -258,18 +258,19 @@ update_system() {
         fi
     fi
     
-    # Perform updates
-    log_info "Installing system updates..."
+    # --- START P3: Unattended Upgrade ---
+    log_info "Installing system updates (unattended)..."
     export DEBIAN_FRONTEND=noninteractive
     
-    if apt upgrade -y; then
+    if apt-get -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" upgrade; then
         log_success "System packages updated successfully"
     else
         log_error "Failed to update some system packages"
         return 1
     fi
+    # --- END P3 ---
     
-    # Check if reboot is required
+    # --- START P3: Check for reboot ---
     if [[ -f /var/run/reboot-required ]]; then
         log_warn "⚠️  SYSTEM REBOOT REQUIRED"
         log_info "Some updates require a system reboot to take effect"
@@ -279,15 +280,25 @@ update_system() {
             cat /var/run/reboot-required.pkgs | head -5
         fi
         
-        echo ""
-        log_warn "Schedule a system reboot when convenient:"
-        log_info "  sudo reboot"
+        if [[ "$FORCE" == "true" ]]; then
+            log_warn "Auto-rebooting system (--force specified)"
+            # Send email *before* rebooting
+            send_notification_email "System Update: Rebooting" "System update completed. Reboot is required and being initiated now."
+            sleep 5
+            sudo reboot
+            exit 0 # Exit script to allow reboot
+        else
+            echo ""
+            log_warn "Schedule a system reboot when convenient:"
+            log_info "  sudo reboot"
+        fi
         
         return 2  # Special return code for reboot required
     else
         log_success "System update completed, no reboot required"
         return 0
     fi
+    # --- END P3 ---
 }
 
 # --- Health Check After Update ---
@@ -313,35 +324,6 @@ verify_system_health() {
     fi
 }
 
-# --- Update Notifications ---
-send_update_notification() {
-    local update_type="$1"
-    local status="$2"  # success, failed, reboot_required
-    
-    # Simple notification (could be enhanced with SMTP if configured)
-    local subject="VaultWarden Update: $update_type"
-    local message=""
-    
-    case "$status" in
-        "success")
-            message="Update completed successfully on $(hostname -f 2>/dev/null || hostname)"
-            ;;
-        "failed")
-            message="Update failed on $(hostname -f 2>/dev/null || hostname). Check system logs."
-            ;;
-        "reboot_required")
-            message="Update completed but system reboot required on $(hostname -f 2>/dev/null || hostname)"
-            ;;
-    esac
-    
-    log_info "Update notification: $message"
-    
-    # Log to system log if available
-    if has_command logger; then
-        logger "VaultWarden Update [$status]: $message"
-    fi
-}
-
 # --- Main Execution ---
 main() {
     log_info "VaultWarden Update Manager"
@@ -353,6 +335,7 @@ main() {
     
     local exit_code=0
     local reboot_required=false
+    local update_summary="Update job started."
     
     # Show update plan
     echo ""
@@ -361,16 +344,19 @@ main() {
         "containers")
             log_info "  - Update Docker containers"
             log_info "  - Verify service health"
+            update_summary="Container update task."
             ;;
         "system")
             log_info "  - Update system packages"
             log_info "  - Check reboot requirements"
+            update_summary="System update task."
             ;;
         "all")
             log_info "  - Create backup"
             log_info "  - Update Docker containers"
             log_info "  - Update system packages"
             log_info "  - Verify service health"
+            update_summary="Full system and container update task."
             ;;
         *)
             log_error "Unknown update type: $UPDATE_TYPE"
@@ -403,13 +389,14 @@ main() {
             if [[ $exit_code -eq 0 ]]; then
                 update_containers || exit_code=$?
             fi
+            update_summary="Container update completed."
             ;;
         "system")
             update_system
             case $? in
-                0) ;;  # Success
-                1) exit_code=1 ;;  # Failed
-                2) reboot_required=true ;;  # Reboot required
+                0) update_summary="System update completed. No reboot required." ;;
+                1) exit_code=1; update_summary="System update FAILED." ;;
+                2) reboot_required=true; update_summary="System update completed. REBOOT REQUIRED." ;;
             esac
             ;;
         "all")
@@ -420,10 +407,12 @@ main() {
             if [[ $exit_code -eq 0 ]]; then
                 update_system
                 case $? in
-                    0) ;;  # Success
-                    1) exit_code=1 ;;  # Failed
-                    2) reboot_required=true ;;  # Reboot required
+                    0) update_summary="Full update completed. No reboot required." ;;
+                    1) exit_code=1; update_summary="Full update FAILED during system phase." ;;
+                    2) reboot_required=true; update_summary="Full update completed. REBOOT REQUIRED." ;;
                 esac
+            else
+                update_summary="Full update FAILED during container phase."
             fi
             ;;
     esac
@@ -433,30 +422,35 @@ main() {
         verify_system_health || log_warn "Post-update health check issues detected"
     fi
     
-    # Send notification and summary
+    # --- START P2: Send Notification ---
     echo ""
     if [[ $exit_code -eq 0 ]]; then
         if [[ "$reboot_required" == "true" ]]; then
             log_success "Update completed successfully - REBOOT REQUIRED"
-            send_update_notification "$UPDATE_TYPE" "reboot_required"
         else
             log_success "Update completed successfully"
-            send_update_notification "$UPDATE_TYPE" "success"
         fi
         
-        echo ""
-        echo "Update Summary:"
-        echo "  Type: $UPDATE_TYPE"
-        echo "  Status: Success"
-        if [[ "$reboot_required" == "true" ]]; then
-            echo "  Reboot: Required"
-        fi
-        echo "  Completed: $(date)"
-        
+        log_info "Sending update notification email..."
+        send_notification_email "Update Completed: $UPDATE_TYPE" "$update_summary"
+
     else
         log_error "Update failed"
-        send_update_notification "$UPDATE_TYPE" "failed"
-        
+        log_info "Sending update failure email..."
+        send_notification_email "Update FAILED: $UPDATE_TYPE" "$update_summary"
+    fi
+    # --- END P2 ---
+
+    echo ""
+    echo "Update Summary:"
+    echo "  Type: $UPDATE_TYPE"
+    echo "  Status: $update_summary"
+    if [[ "$reboot_required" == "true" ]]; then
+        echo "  Reboot: Required"
+    fi
+    echo "  Completed: $(date)"
+    
+    if [[ $exit_code -ne 0 ]]; then
         echo ""
         echo "Update failed. Common troubleshooting:"
         echo "  - Check service logs: docker compose logs"
