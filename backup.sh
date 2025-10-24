@@ -144,14 +144,49 @@ create_full_backup() {
     [[ -d fail2ban ]] && cp -r fail2ban "$temp_dir/" || log_warn "fail2ban/ directory not found"
     [[ -d secrets ]] && cp -r secrets "$temp_dir/" || log_warn "secrets/ directory not found"
 
+    # --- START MODIFICATION ---
     # Copy data directory
     log_info "Including data directory..."
     local state_dir
     state_dir=$(get_config_value "PROJECT_STATE_DIR" "/var/lib/vaultwarden")
+
+    # Create a safe database snapshot first
+    local db_snapshot="$temp_dir/db.sqlite3.snapshot"
+    log_info "Creating consistent database snapshot..."
+
+    if is_service_running "vaultwarden"; then
+        if ! exec_in_service vaultwarden sqlite3 /data/db.sqlite3 ".backup /tmp/backup.db"; then
+            log_error "Failed to create database snapshot inside container"
+            return 1
+        fi
+        if ! docker compose exec vaultwarden cat /tmp/backup.db > "$db_snapshot"; then
+            log_error "Failed to copy database snapshot from container"
+            return 1
+        fi
+        exec_in_service vaultwarden rm -f /tmp/backup.db 2>/dev/null || true
+    else
+        log_info "VaultWarden is not running, copying database file directly..."
+        local db_file="$state_dir/data/bwdata/db.sqlite3"
+        if [[ -f "$db_file" ]]; then
+            cp "$db_file" "$db_snapshot"
+        else
+            log_warn "Database file not found, backup will not contain a database."
+        fi
+    fi
+
     if [[ -d "$state_dir/data" ]]; then
         mkdir -p "$temp_dir/data"
-        cp -r "$state_dir/data"/* "$temp_dir/data/" 2>/dev/null || log_warn "Failed to copy some data files"
+        # Copy attachments, sends, etc. (everything *except* the live db)
+        cp -r "$state_dir/data/attachments" "$temp_dir/data/attachments" 2>/dev/null || true
+        cp -r "$state_dir/data/sends" "$temp_dir/data/sends" 2>/dev/null || true
+        
+        # Place the safe snapshot where the real DB would be
+        if [[ -f "$db_snapshot" ]]; then
+            mkdir -p "$temp_dir/data/bwdata"
+            mv "$db_snapshot" "$temp_dir/data/bwdata/db.sqlite3"
+        fi
     fi
+    # --- END MODIFICATION ---
 
     # Create system info file
     local domain admin_email
