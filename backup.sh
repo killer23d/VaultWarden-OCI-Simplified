@@ -79,6 +79,19 @@ create_db_backup() {
             return 1
         fi
 
+        # --- START FIX (H2: Integrity Check) ---
+        log_info "Verifying database backup integrity..."
+        local integrity_check
+        integrity_check=$(exec_in_service vaultwarden sqlite3 /tmp/backup.db "PRAGMA integrity_check;" 2>/dev/null)
+        
+        if [[ "$integrity_check" != "ok" ]]; then
+            log_error "Database integrity check failed: $integrity_check"
+            exec_in_service vaultwarden rm -f /tmp/backup.db 2>/dev/null || true
+            return 1
+        fi
+        log_success "Database integrity verified"
+        # --- END FIX (H2) ---
+
         if ! docker compose exec vaultwarden cat /tmp/backup.db | gzip > "$backup_dir/$backup_file"; then
             log_error "Failed to copy database backup from container"
             return 1
@@ -144,7 +157,7 @@ create_full_backup() {
     [[ -d fail2ban ]] && cp -r fail2ban "$temp_dir/" || log_warn "fail2ban/ directory not found"
     [[ -d secrets ]] && cp -r secrets "$temp_dir/" || log_warn "secrets/ directory not found"
 
-    # --- START MODIFICATION ---
+    # --- START MODIFICATION (FIX C3: Full Backup) ---
     # Copy data directory
     log_info "Including data directory..."
     local state_dir
@@ -159,6 +172,19 @@ create_full_backup() {
             log_error "Failed to create database snapshot inside container"
             return 1
         fi
+        
+        # --- START FIX (H2: Integrity Check) ---
+        log_info "Verifying database snapshot integrity..."
+        local integrity_check
+        integrity_check=$(exec_in_service vaultwarden sqlite3 /tmp/backup.db "PRAGMA integrity_check;" 2>/dev/null)
+        if [[ "$integrity_check" != "ok" ]]; then
+            log_error "Database integrity check failed: $integrity_check"
+            exec_in_service vaultwarden rm -f /tmp/backup.db 2>/dev/null || true
+            return 1
+        fi
+        log_success "Database snapshot integrity verified"
+        # --- END FIX (H2) ---
+        
         if ! docker compose exec vaultwarden cat /tmp/backup.db > "$db_snapshot"; then
             log_error "Failed to copy database snapshot from container"
             return 1
@@ -175,15 +201,15 @@ create_full_backup() {
     fi
 
     if [[ -d "$state_dir/data" ]]; then
-        mkdir -p "$temp_dir/data"
-        # Copy attachments, sends, etc. (everything *except* the live db)
-        cp -r "$state_dir/data/attachments" "$temp_dir/data/attachments" 2>/dev/null || true
-        cp -r "$state_dir/data/sends" "$temp_dir/data/sends" 2>/dev/null || true
+        log_info "Copying all data files..."
+        # Copy the entire data directory
+        cp -r "$state_dir/data" "$temp_dir/data"
         
-        # Place the safe snapshot where the real DB would be
+        # Overwrite the (potentially live) copied DB with the safe snapshot
         if [[ -f "$db_snapshot" ]]; then
             mkdir -p "$temp_dir/data/bwdata"
             mv "$db_snapshot" "$temp_dir/data/bwdata/db.sqlite3"
+            log_info "Replaced live DB with safe snapshot in backup."
         fi
     fi
     # --- END MODIFICATION ---
