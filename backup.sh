@@ -17,7 +17,10 @@ source "lib/crypto.sh"
 
 # --- Configuration ---
 BACKUP_TYPE="db"  # db, full, or emergency
-EMAIL_BACKUP=false
+# --- START P1: Add Rclone/Email flags ---
+EMAIL_NOTIFY=false
+RCLONE_SYNC=false
+# --- END P1 ---
 RETENTION_DAYS=30
 
 # --- Help ---
@@ -30,7 +33,8 @@ USAGE:
 
 OPTIONS:
     --type TYPE      Backup type: db, full, or emergency (default: db)
-    --email          Email backup file after creation
+    --rclone         Sync backups directory to rclone remote after creation
+    --email          Send email notification on completion
     --retention N    Keep backups for N days (default: 30)
     --help           Show this help
 
@@ -43,7 +47,7 @@ EXAMPLES:
     ./backup.sh                    # Quick database backup
     ./backup.sh --type full        # Full system backup  
     ./backup.sh --type emergency   # Create emergency kit
-    ./backup.sh --email            # Backup and email result
+    ./backup.sh --rclone --email   # Backup, sync to cloud, and send email
 EOF
 }
 
@@ -51,7 +55,10 @@ EOF
 while [[ $# -gt 0 ]]; do
     case $1 in
         --type) BACKUP_TYPE="$2"; shift 2 ;;
-        --email) EMAIL_BACKUP=true; shift ;;
+        # --- START P1: Parse new flags ---
+        --email) EMAIL_NOTIFY=true; shift ;;
+        --rclone) RCLONE_SYNC=true; shift ;;
+        # --- END P1 ---
         --retention) RETENTION_DAYS="$2"; shift 2 ;;
         --help) show_help; exit 0 ;;
         *) log_error "Unknown option: $1"; show_help; exit 1 ;;
@@ -79,7 +86,6 @@ create_db_backup() {
             return 1
         fi
 
-        # --- START FIX (H2: Integrity Check) ---
         log_info "Verifying database backup integrity..."
         local integrity_check
         integrity_check=$(exec_in_service vaultwarden sqlite3 /tmp/backup.db "PRAGMA integrity_check;" 2>/dev/null)
@@ -90,7 +96,6 @@ create_db_backup() {
             return 1
         fi
         log_success "Database integrity verified"
-        # --- END FIX (H2) ---
 
         if ! docker compose exec vaultwarden cat /tmp/backup.db | gzip > "$backup_dir/$backup_file"; then
             log_error "Failed to copy database backup from container"
@@ -157,7 +162,6 @@ create_full_backup() {
     [[ -d fail2ban ]] && cp -r fail2ban "$temp_dir/" || log_warn "fail2ban/ directory not found"
     [[ -d secrets ]] && cp -r secrets "$temp_dir/" || log_warn "secrets/ directory not found"
 
-    # --- START MODIFICATION (FIX C3: Full Backup) ---
     # Copy data directory
     log_info "Including data directory..."
     local state_dir
@@ -173,7 +177,6 @@ create_full_backup() {
             return 1
         fi
         
-        # --- START FIX (H2: Integrity Check) ---
         log_info "Verifying database snapshot integrity..."
         local integrity_check
         integrity_check=$(exec_in_service vaultwarden sqlite3 /tmp/backup.db "PRAGMA integrity_check;" 2>/dev/null)
@@ -183,7 +186,6 @@ create_full_backup() {
             return 1
         fi
         log_success "Database snapshot integrity verified"
-        # --- END FIX (H2) ---
         
         if ! docker compose exec vaultwarden cat /tmp/backup.db > "$db_snapshot"; then
             log_error "Failed to copy database snapshot from container"
@@ -202,17 +204,14 @@ create_full_backup() {
 
     if [[ -d "$state_dir/data" ]]; then
         log_info "Copying all data files..."
-        # Copy the entire data directory
         cp -r "$state_dir/data" "$temp_dir/data"
         
-        # Overwrite the (potentially live) copied DB with the safe snapshot
         if [[ -f "$db_snapshot" ]]; then
             mkdir -p "$temp_dir/data/bwdata"
             mv "$db_snapshot" "$temp_dir/data/bwdata/db.sqlite3"
             log_info "Replaced live DB with safe snapshot in backup."
         fi
     fi
-    # --- END MODIFICATION ---
 
     # Create system info file
     local domain admin_email
@@ -347,41 +346,69 @@ EOF
     return 0
 }
 
-# --- Email Function ---
-email_backup() {
-    local backup_file="$1"
-
-    if [[ ! -f "$backup_file" ]]; then
-        log_error "Backup file not found: $backup_file"
+# --- START P1: Rclone Offsite Sync ---
+rclone_sync_offsite() {
+    local backup_file_path="$1"
+    
+    log_info "Starting offsite backup sync..."
+    
+    if ! has_command rclone; then
+        log_error "rclone command not found. Cannot sync offsite."
+        log_info "Install with: sudo apt install rclone"
         return 1
     fi
-
-    # Check if SMTP is configured
-    local smtp_host
-    smtp_host=$(get_config_value "SMTP_HOST" "")
-    if [[ -z "$smtp_host" ]]; then
-        log_warn "SMTP not configured, cannot email backup"
-        log_info "Configure SMTP settings in secrets to enable email"
+    
+    local remote_name
+    remote_name=$(get_config_value "RCLONE_REMOTE_NAME" "")
+    
+    if [[ -z "$remote_name" ]]; then
+        log_warn "RCLONE_REMOTE_NAME not set in .env. Skipping offsite sync."
         return 1
     fi
+    
+    local remote_path="$remote_name:vaultwarden_backups"
+    
+    log_info "Syncing local backup directory to remote: $remote_path"
+    
+    # We sync the whole backup directory to keep it simple
+    if ! rclone copy "$PROJECT_ROOT/backups" "$remote_path"; then
+        log_error "Rclone sync failed"
+        return 1
+    fi
+    
+    log_success "Rclone sync completed"
+    
+    # --- Start User Suggestion: Backup Size Validation ---
+    log_info "Verifying remote backup file..."
+    local backup_filename
+    backup_filename=$(basename "$backup_file_path")
+    local remote_file_path="$remote_path/$(basename "$(dirname "$backup_file_path")")/$backup_filename"
 
-    log_info "Emailing backup..."
-    local subject="VaultWarden Backup - $(date '+%Y-%m-%d %H:%M')"
-    local admin_email
-    admin_email=$(get_config_value "ADMIN_EMAIL")
+    local local_size
+    local_size=$(du -b "$backup_file_path" | cut -f1)
+    
+    local remote_size_json
+    remote_size_json=$(rclone size "$remote_file_path" --json 2>/dev/null)
+    
+    if [[ -z "$remote_size_json" ]]; then
+        log_warn "Could not get remote file size for verification."
+        return 0 # Don't fail the job, just warn
+    fi
+    
+    local remote_size
+    remote_size=$(echo "$remote_size_json" | jq -r '.bytes // 0')
 
-    # Use simple mail command if available
-    if has_command mail; then
-        local size
-        size=$(du -h "$backup_file" | cut -f1)
-        echo "VaultWarden backup created: $(basename "$backup_file") ($size)" |         mail -s "$subject" -A "$backup_file" "$admin_email"
-
-        log_success "Backup emailed to $admin_email"
+    if [[ "$local_size" == "$remote_size" ]]; then
+        log_success "Cloud backup size verified: $local_size bytes"
     else
-        log_warn "Mail command not available, cannot send email"
-        log_info "Install mailutils package to enable email: sudo apt install mailutils"
+        log_warn "Cloud backup size mismatch! Local: $local_size, Remote: $remote_size"
+        log_warn "This could indicate a corrupted upload. Please check remote."
     fi
+    # --- End User Suggestion ---
+    
+    return 0
 }
+# --- END P1 ---
 
 # --- Cleanup Function ---
 cleanup_old_backups() {
@@ -418,6 +445,13 @@ main() {
 
     # Check required commands
     require_commands tar gzip age || exit 1
+    # --- P1: Check rclone if flag is set ---
+    if [[ "$RCLONE_SYNC" == "true" ]]; then
+        require_commands rclone || exit 1
+    fi
+    if [[ "$EMAIL_NOTIFY" == "true" ]]; then
+        require_commands mail || exit 1
+    fi
 
     # Check Age key availability
     if ! check_age_key; then
@@ -445,17 +479,23 @@ main() {
             exit 1
             ;;
     esac
+    
+    local file_size
+    file_size=$(du -h "$backup_file" | cut -f1)
 
-    # Email if requested
-    if [[ "$EMAIL_BACKUP" == "true" ]]; then
-        email_backup "$backup_file"
+    # --- START P1: Handle Rclone Sync ---
+    local sync_status="Skipped"
+    if [[ "$RCLONE_SYNC" == "true" ]]; then
+        if rclone_sync_offsite "$backup_file"; then
+            sync_status="Success"
+        else
+            sync_status="Failed"
+        fi
     fi
+    # --- END P1 ---
 
     # Cleanup old backups
     cleanup_old_backups
-
-    local file_size
-    file_size=$(du -h "$backup_file" | cut -f1)
 
     log_success "Backup completed successfully!"
     echo ""
@@ -463,9 +503,25 @@ main() {
     echo "  Type: $BACKUP_TYPE"
     echo "  File: $backup_file"  
     echo "  Size: $file_size"
+    echo "  Rclone Sync: $sync_status"
     echo ""
     echo "To restore:"
     echo "  age -d -i secrets/keys/age-key.txt '$backup_file' | tar -xzf -"
+    
+    # --- START P1: Handle Email Notification ---
+    if [[ "$EMAIL_NOTIFY" == "true" ]]; then
+        log_info "Sending completion email..."
+        local email_subject="Backup Completed: $BACKUP_TYPE"
+        local email_body="VaultWarden backup job completed.
+        
+Type: $BACKUP_TYPE
+File: $(basename "$backup_file")
+Size: $file_size
+Rclone Sync: $sync_status
+"
+        send_notification_email "$email_subject" "$email_body"
+    fi
+    # --- END P1 ---
 }
 
 main "$@"
