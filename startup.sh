@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # startup.sh - Simplified VaultWarden stack orchestration
+# Uses centralized library functions
 
 set -euo pipefail
 trap "rm -rf '$PROJECT_ROOT/secrets/.docker_secrets' '$PROJECT_ROOT/.env.secrets' 2>/dev/null" EXIT HUP INT TERM
@@ -80,8 +81,8 @@ prepare_docker_secrets() {
     fi
 
     # Get all secrets and create individual files
-    # --- FIX (C2): Add cloudflare_api_token to the list ---
-    local secrets=("admin_token" "smtp_password" "push_installation_key" "cloudflare_api_token")
+    # --- FIX: Add push_installation_id ---
+    local secrets=("admin_token" "smtp_password" "push_installation_id" "push_installation_key" "cloudflare_api_token")
 
     for secret in "${secrets[@]}"; do
         local value
@@ -126,6 +127,7 @@ prepare_environment_variables() {
     fi
 
     # Write to .env.secrets for docker-compose if needed
+    # Note: This file isn't strictly necessary as variables are exported, but kept for clarity/debugging
     cat > .env.secrets << EOF
 # Generated environment variables from secrets
 # This file is created automatically by startup.sh
