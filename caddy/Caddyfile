@@ -1,101 +1,83 @@
 # Caddyfile for VaultWarden-OCI-NG
-# Automatic HTTPS with security headers and rate limiting
 
-{$DOMAIN} {
-    # Global settings
+{
+    # Global options
+    email {$ADMIN_EMAIL}
+    acme_ca https://acme-v02.api.letsencrypt.org/directory
+    # acme_dns cloudflare {env.CLOUDFLARE_API_TOKEN} # Uncomment if using DNS challenge
+
+    # Import the Cloudflare IP ranges to trust them as a proxy
+    import /etc/caddy/cloudflare-ips.caddy
+}
+
+# Main site configuration for your domain (variable {$DOMAIN} comes from .env, no protocol)
+https://{$DOMAIN} {
+    # P3 FIX: Define named matchers at the top for better readability
+    @admin path /admin*
+    @notifications path /notifications/hub*
+
+    # Trust proxies matching the imported Cloudflare IP ranges
+    # This ensures X-Real-IP etc. are correctly populated from Cloudflare headers
+    trusted_proxies @cloudflare
+
+    # Enable modern compression
+    encode gzip zstd
+
+    # Secure the /admin endpoint with Basic Authentication and Rate Limiting
+    # The hash {$ADMIN_BASIC_AUTH_HASH} is provided via environment variable from secrets
+    rate_limit @admin 5r/m
+    basicauth @admin {
+        admin {$ADMIN_BASIC_AUTH_HASH}
+    }
+    reverse_proxy @admin vaultwarden:8080 {
+        header_up X-Real-IP {http.request.header.CF-Connecting-IP} # Pass Cloudflare IP
+    }
+
+    # Notifications endpoint for Bitwarden clients (WebSockets)
+    # Vaultwarden runs websockets on port 3012 by default when WEBSOCKET_ENABLED=true
+    reverse_proxy @notifications vaultwarden:3012 {
+        header_up X-Real-IP {http.request.header.CF-Connecting-IP} # Pass Cloudflare IP
+    }
+
+    # Main application proxy (all other requests)
+    reverse_proxy vaultwarden:8080 {
+        header_up X-Real-IP {http.request.header.CF-Connecting-IP} # Pass Cloudflare IP
+    }
+
+    # Logging configuration (consistent with Docker logging where possible)
     log {
-        output file /logs/access.log {
-            roll_size 10MB
-            roll_keep 5
-            roll_keep_for 24h
+        output file /var/log/caddy/access.log {
+            roll_size 10mb  # Roll logs after 10 MB (matches Docker)
+            roll_keep 5     # Keep 5 rolled files (matches Docker)
+            roll_keep_for 720h # Keep files for 30 days max (time-based secondary cleanup)
         }
         format json
     }
 
-    # Security headers
+    # Security Headers
     header {
-        # Security headers
-        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
-        X-Content-Type-Options "nosniff"
-        X-Frame-Options "DENY"
-        X-XSS-Protection "1; mode=block"
-        Referrer-Policy "strict-origin-when-cross-origin"
-
-        # Remove server info
+        # Remove server information for security
         -Server
-        -X-Powered-By
-
-        # Content Security Policy (adjust as needed)
-        Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self'; frame-src 'self'; object-src 'none'; base-uri 'self';"
-    }
-
-    # Rate limiting for admin endpoints
-    @admin {
-        path /admin*
-    }
-
-    rate_limit @admin {
-        zone admin_zone {
-            key {remote_host}
-            events 10
-            window 5m
-        }
-    }
-
-    # Basic auth for admin (using secrets)  
-    @admin_auth {
-        path /admin*
-        not {
-            header Authorization "Basic*"
-        }
-    }
-
-    # Block common attack paths
-    @blocked {
-        path /.env* /config* /.git* /.htaccess* /wp-admin* /wp-login* /phpMyAdmin* /admin.php*
-    }
-
-    respond @blocked 404
-
-    # Main proxy to VaultWarden
-    reverse_proxy vaultwarden:80 {
-        # Preserve real IP from Cloudflare if configured
-        header_up X-Real-IP {http.request.header.CF-Connecting-IP}
-        header_up X-Forwarded-For {http.request.header.CF-Connecting-IP}
-        header_up X-Forwarded-Proto {scheme}
-        header_up Host {host}
-
-        # Health check
-        health_uri /alive
-        health_interval 30s
-        health_timeout 5s
-
-        # Connection settings
-        transport http {
-            keepalive 30s
-            keepalive_idle_conns 10
-        }
-    }
-
-    # WebSocket support for notifications
-    @websocket {
-        header Connection *Upgrade*
-        header Upgrade websocket
-    }
-
-    reverse_proxy @websocket vaultwarden:3012
-}
-
-# Redirect www to non-www
-www.{$DOMAIN} {
-    redir https://{$DOMAIN}{uri} permanent
-}
-
-# Health check endpoint for monitoring
-:8080 {
-    respond /health "OK" 200
-
-    log {
-        output discard
+        # Enforce HTTPS and preload HSTS (ensure domain is stable before enabling preload)
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        # Prevent content type sniffing
+        X-Content-Type-Options "nosniff"
+        # Prevent clickjacking
+        X-Frame-Options "DENY"
+        # Control referrer information
+        Referrer-Policy "strict-origin-when-cross-origin"
+        # Content Security Policy - Allows self, inline scripts/styles (needed by web vault),
+        # data URIs for images, and WebSocket connections to self.
+        Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self' wss://{$DOMAIN}; form-action 'self'; base-uri 'self';"
     }
 }
+
+# Global HTTP to HTTPS redirect for the main domain
+http://{$DOMAIN} {
+    redir https://{host}{uri} permanent
+}
+
+# Optional: Add a simple health check endpoint if needed by external monitors
+# http://:8081 {
+#    respond /health "OK" 200
+# }
