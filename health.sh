@@ -19,10 +19,14 @@ source "lib/crypto.sh"
 COMPREHENSIVE=false
 AUTO_HEAL=false
 QUIET=false
+# --- START P2: Add email flag ---
+EMAIL_ALERT=false
+# --- END P2 ---
 
 # --- Health Tracking ---
 WARNINGS=0
 ERRORS=0
+ERROR_DETAILS=""
 
 # --- Help ---
 show_help() {
@@ -35,6 +39,7 @@ USAGE:
 OPTIONS:
     --comprehensive  Run extended health checks
     --auto-heal      Automatically attempt to fix issues
+    --email-alert    Send email notification if errors are found
     --quiet          Only show warnings and errors
     --help           Show this help
 
@@ -42,6 +47,7 @@ EXAMPLES:
     ./health.sh                    # Basic health check
     ./health.sh --comprehensive    # Full system health check
     ./health.sh --auto-heal        # Check health and auto-repair
+    ./health.sh --email-alert      # Check and send email on failure
 EOF
 }
 
@@ -50,6 +56,9 @@ while [[ $# -gt 0 ]]; do
     case $1 in
         --comprehensive) COMPREHENSIVE=true; shift ;;
         --auto-heal) AUTO_HEAL=true; shift ;;
+        # --- START P2: Parse email flag ---
+        --email-alert) EMAIL_ALERT=true; shift ;;
+        # --- END P2 ---
         --quiet) QUIET=true; shift ;;
         --help) show_help; exit 0 ;;
         *) log_error "Unknown option: $1"; show_help; exit 1 ;;
@@ -69,6 +78,7 @@ check_warn() {
 check_fail() {
     log_error "❌ $*"
     ((ERRORS++))
+    ERROR_DETAILS+="- $*\n"
 }
 
 # --- Core Health Checks ---
@@ -168,6 +178,29 @@ check_system_resources() {
 
     return 0
 }
+
+# --- START User Suggestion: Backup Disk Space Check ---
+check_backup_space() {
+    [[ "$QUIET" != "true" ]] && log_info "Checking backup disk space..."
+    
+    local backup_dir="$PROJECT_ROOT/backups"
+    if [[ ! -d "$backup_dir" ]]; then
+        check_warn "Backup directory not found, skipping space check."
+        return
+    fi
+    
+    local backup_usage
+    backup_usage=$(df "$backup_dir" | awk 'NR==2{print $5}' | sed 's/%//')
+    
+    if [[ "$backup_usage" -lt 85 ]]; then
+        check_pass "Backup disk usage: ${backup_usage}%"
+    elif [[ "$backup_usage" -lt 95 ]]; then
+        check_warn "Backup disk usage high: ${backup_usage}%"
+    else
+        check_fail "Backup disk usage critical: ${backup_usage}%"
+    fi
+}
+# --- END User Suggestion ---
 
 check_network_health() {
     [[ "$QUIET" != "true" ]] && log_info "Checking network connectivity..."
@@ -337,6 +370,7 @@ run_health_checks() {
         check_network_health
         check_backup_health
         check_secrets_health
+        check_backup_space # User Suggestion
     fi
 
     # Auto-heal if requested and issues found
@@ -377,10 +411,22 @@ main() {
         echo "  - Run: ./startup.sh --force-restart"
         echo "  - Check logs: docker compose logs <service>"
         echo "  - Restart system: sudo systemctl restart docker"
+        
+        # --- START P2: Send Email Alert ---
+        if [[ "$EMAIL_ALERT" == "true" ]]; then
+            log_info "Sending failure alert email..."
+            local email_subject="HEALTH CHECK FAILED"
+            local email_body="VaultWarden health check detected $ERRORS error(s).
+
+Errors:
+$ERROR_DETAILS
+Please review the system."
+            send_notification_email "$email_subject" "$email_body"
+        fi
+        # --- END P2 ---
     fi
 
     exit "$exit_code"
 }
 
 main "$@"
-
