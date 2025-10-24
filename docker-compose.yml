@@ -1,8 +1,6 @@
 version: "3.9"
 
 # VaultWarden-OCI-NG Docker Compose Configuration
-# Corrected version addressing v4 review feedback
-# --- Added ddclient service ---
 
 services:
   vaultwarden:
@@ -16,7 +14,7 @@ services:
       - DATABASE_URL=sqlite:///data/bwdata/db.sqlite3
       - ADMIN_TOKEN_FILE=/run/secrets/admin_token
 
-      # WebSocket Configuration (Addresses v4 review)
+      # WebSocket Configuration
       - WEBSOCKET_ENABLED=true
       - WEBSOCKET_ADDRESS=0.0.0.0
       - WEBSOCKET_PORT=3012
@@ -31,6 +29,8 @@ services:
       - SMTP_FROM_NAME=VaultWarden
 
       # Push Notifications
+      # --- FIX: Added PUSH_INSTALLATION_ID_FILE ---
+      - PUSH_INSTALLATION_ID_FILE=/run/secrets/push_installation_id
       - PUSH_INSTALLATION_KEY_FILE=/run/secrets/push_installation_key
 
       # Security Settings
@@ -54,10 +54,11 @@ services:
     secrets:
       - admin_token
       - smtp_password
+      # --- FIX: Added push_installation_id ---
+      - push_installation_id
       - push_installation_key
 
     healthcheck:
-      # --- FIX (H3): Tuned for ARM ---
       test: ["CMD", "curl", "-f", "http://localhost:80/alive"]
       interval: 60s
       timeout: 15s
@@ -65,7 +66,6 @@ services:
       start_period: 60s
 
     logging:
-      # --- FIX (C5): Add Log Rotation ---
       driver: "json-file"
       options:
         max-size: "10m"
@@ -74,7 +74,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: ${VAULTWARDEN_MEMORY_LIMIT:-512m}
+          memory: ${VAULTWARDEN_MEMORY_LIMIT:-1g} # Increased default
           cpus: '0.5'
         reservations:
           memory: 256m
@@ -115,7 +115,6 @@ services:
         condition: service_healthy
 
     healthcheck:
-      # --- FIX (H3): Tuned for ARM ---
       test: ["CMD", "caddy", "version"]
       interval: 60s
       timeout: 15s
@@ -123,7 +122,6 @@ services:
       start_period: 30s
 
     logging:
-      # --- FIX (C5): Add Log Rotation ---
       driver: "json-file"
       options:
         max-size: "10m"
@@ -153,9 +151,8 @@ services:
       - F2B_DB_PURGE_AGE=1d
       - F2B_MAX_RETRY=3
       - F2B_DEST_EMAIL=${ADMIN_EMAIL}
-      # --- Add Cloudflare variables (for P1 fix and ddclient consistency) ---
-      - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN:-}
-      - CLOUDFLARE_ZONE_ID=${CLOUDFLARE_ZONE_ID:-}
+      - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN:-} # Read by gomplate in jail.d
+      - CLOUDFLARE_ZONE_ID=${CLOUDFLARE_ZONE_ID:-}     # Read by gomplate in jail.d
 
     volumes:
       - ./fail2ban/jail.d:/config/jail.d:ro
@@ -170,7 +167,6 @@ services:
       - NET_RAW
 
     healthcheck:
-      # --- FIX (H3): Tuned for ARM ---
       test: ["CMD-SHELL", "fail2ban-client ping"]
       interval: 60s
       timeout: 15s
@@ -178,7 +174,6 @@ services:
       start_period: 60s
 
     logging:
-      # --- FIX (C5): Add Log Rotation ---
       driver: "json-file"
       options:
         max-size: "10m"
@@ -195,13 +190,12 @@ services:
 
     network_mode: host
 
-  # --- Add ddclient Service ---
   ddclient:
     image: ddclient/ddclient:${DDCLIENT_VERSION:-3.11.2}
     container_name: vaultwarden_ddclient
     restart: unless-stopped
     user: "1000:1000"
-    
+
     volumes:
       - ./ddclient/ddclient.conf:/etc/ddclient/ddclient.conf:ro
       - ${PROJECT_STATE_DIR:-/var/lib/vaultwarden}/ddclient/cache:/var/cache/ddclient:rw
@@ -211,20 +205,18 @@ services:
       - DD_ZONE=${CLOUDFLARE_ZONE_ID}
       - DD_HOST=${DDCLIENT_HOSTNAME}
       - DD_PASSWORD_FILE=/run/secrets/cloudflare_api_token
-      
+
     secrets:
       - cloudflare_api_token
 
     healthcheck:
-      # --- FIX (H3): Tuned for ARM ---
       test: ["CMD-SHELL", "pidof ddclient"]
       interval: 90s
       timeout: 15s
       retries: 5
       start_period: 60s
-      
+
     logging:
-      # --- FIX (C5): Add Log Rotation ---
       driver: "json-file"
       options:
         max-size: "10m"
@@ -239,8 +231,6 @@ services:
           memory: 32m
           cpus: '0.02'
 
-    # This container only needs to reach the internet, 
-    # but we add it to the network for consistency.
     networks:
       - vaultwarden_network
 
@@ -252,6 +242,9 @@ secrets:
     file: ./secrets/.docker_secrets/admin_basic_auth_hash
   smtp_password:
     file: ./secrets/.docker_secrets/smtp_password
+  # --- FIX: Added push_installation_id ---
+  push_installation_id:
+    file: ./secrets/.docker_secrets/push_installation_id
   push_installation_key:
     file: ./secrets/.docker_secrets/push_installation_key
   cloudflare_api_token:
