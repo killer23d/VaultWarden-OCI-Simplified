@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # setup.sh - Complete VaultWarden-OCI-NG system setup with library integration
-# Uses centralized library functions
+# Corrected version addressing v4 review feedback
 
 set -euo pipefail
 
@@ -146,7 +146,7 @@ install_dependencies() {
     }
 
     # Required packages
-    local packages=("docker.io" "docker-compose-plugin" "age" "sops" "ufw" "curl" "jq" "sqlite3" "gzip" "tar")
+    local packages=("docker.io" "docker-compose-plugin" "age" "sops" "ufw" "curl" "jq" "sqlite3" "gzip" "tar" "cron")
     local missing_packages=()
 
     # Check which packages are missing
@@ -167,13 +167,24 @@ install_dependencies() {
         log_success "All required packages are already installed"
     fi
 
-    # Enable and start Docker
-    log_info "Configuring Docker service..."
+    # Enable and start services
+    log_info "Configuring system services..."
+
+    # Docker service
     systemctl enable docker || log_warn "Failed to enable Docker service"
     systemctl start docker || {
         log_error "Failed to start Docker service"
         return 1
     }
+
+    # Cron service
+    local cron_service="cron"
+    if systemctl list-unit-files | grep -q "crond.service"; then
+        cron_service="crond"
+    fi
+
+    systemctl enable "$cron_service" || log_warn "Failed to enable cron service"
+    systemctl start "$cron_service" || log_warn "Failed to start cron service"
 
     # Add current user to docker group
     local real_user
@@ -242,9 +253,21 @@ setup_directories() {
 
     # Create main directories using library function
     ensure_dir "$state_dir" 755 "$real_user:$real_user"
-    ensure_dir "$state_dir/data" 755 "$real_user:$real_user"
+
+    # Data directory with stricter permissions (addresses v4 review)
+    ensure_dir "$state_dir/data" 700 "$real_user:$real_user"
+    log_info "Data directory created with strict permissions (700)"
+
     ensure_dir "$state_dir/logs" 755 "$real_user:$real_user"
     ensure_dir "$state_dir/backups" 755 "$real_user:$real_user"
+    ensure_dir "$state_dir/caddy" 755 "$real_user:$real_user"
+    ensure_dir "$state_dir/caddy/data" 755 "$real_user:$real_user"
+    ensure_dir "$state_dir/caddy/config" 755 "$real_user:$real_user"
+
+    # Create log subdirectories
+    ensure_dir "$state_dir/logs/caddy" 755 "$real_user:$real_user"
+    ensure_dir "$state_dir/logs/vaultwarden" 755 "$real_user:$real_user"
+    ensure_dir "$state_dir/logs/fail2ban" 755 "$real_user:$real_user"
 
     # Create project directories
     ensure_dir "$PROJECT_ROOT/secrets" 700 "$real_user:$real_user"
@@ -254,7 +277,7 @@ setup_directories() {
     ensure_dir "$PROJECT_ROOT/backups/full" 755 "$real_user:$real_user"
     ensure_dir "$PROJECT_ROOT/backups/emergency" 755 "$real_user:$real_user"
 
-    log_success "Directory structure created"
+    log_success "Directory structure created with appropriate permissions"
     return 0
 }
 
@@ -357,7 +380,7 @@ setup_environment() {
         fi
     fi
 
-    # Create .env file
+    # Create .env file with explicit version definitions (addresses v4 review)
     cat > "$env_file" << EOF
 # VaultWarden-OCI-NG Configuration
 # Generated on $(date)
@@ -371,18 +394,20 @@ PROJECT_NAME=vaultwarden-oci
 PROJECT_STATE_DIR=$state_dir
 COMPOSE_PROJECT_NAME=vaultwarden
 
-# VaultWarden Configuration
+# Container Versions (Single source of truth per v4 review)
 VAULTWARDEN_VERSION=1.30.5
+CADDY_VERSION=2.8.4
+FAIL2BAN_VERSION=1.1.0
+
+# VaultWarden Configuration
 VAULTWARDEN_DATA_FOLDER=$state_dir/data
 VAULTWARDEN_LOG_LEVEL=info
 
 # Caddy Configuration
-CADDY_VERSION=2.7.6
 CADDY_DATA_DIR=$state_dir/caddy
 CADDY_CONFIG_DIR=$PROJECT_ROOT/caddy
 
 # fail2ban Configuration
-FAIL2BAN_VERSION=1.1.0
 FAIL2BAN_CONFIG_DIR=$PROJECT_ROOT/fail2ban
 FAIL2BAN_LOG_LEVEL=INFO
 
@@ -416,7 +441,7 @@ EOF
     real_user=$(get_real_user)
     chown "$real_user:$real_user" "$env_file"
 
-    log_success "Environment configuration created"
+    log_success "Environment configuration created with explicit version definitions"
     return 0
 }
 
@@ -453,6 +478,7 @@ admin_token: $admin_token
 
 # Basic auth hash for admin panel protection
 # Generate with bcrypt generator: https://bcrypt-generator.com/
+# This is used by Caddy for /admin protection
 admin_basic_auth_hash: CHANGE_ME_BCRYPT_HASH
 
 # SMTP configuration (if email notifications desired)
@@ -464,7 +490,7 @@ backup_passphrase: $backup_pass
 # Optional: Push notification key
 push_installation_key: ""
 
-# Optional: Cloudflare API token
+# Optional: Cloudflare API token for DNS challenges
 cloudflare_api_token: ""
 EOF
 
@@ -481,6 +507,7 @@ EOF
         log_info "  Run: ./edit-secrets.sh"
         log_info "  Update admin_basic_auth_hash with bcrypt hash"
         log_info "  Configure SMTP password if using email"
+        log_info "  The admin_basic_auth_hash is required for Caddy admin protection"
     else
         log_error "Failed to encrypt secrets file"
         return 1
@@ -650,13 +677,17 @@ main() {
     echo ""
     echo "Next steps:"
     echo "  1. Update secrets: ./edit-secrets.sh"
+    echo "     • CRITICAL: Set admin_basic_auth_hash for Caddy admin protection"
+    echo "     • Configure SMTP password if using email notifications"
     echo "  2. Review configuration: nano .env"
     echo "  3. Start services: ./startup.sh"
     echo "  4. Setup automation: sudo ./cron-setup.sh"
+    echo "  5. Run health check: ./health.sh --comprehensive"
     echo ""
     echo "Your VaultWarden will be available at: https://$DOMAIN"
-    echo "Admin panel: https://$DOMAIN/admin"
+    echo "Admin panel: https://$DOMAIN/admin (protected by basic auth)"
     echo ""
+    log_warn "IMPORTANT: The admin panel requires admin_basic_auth_hash to be configured!"
     log_info "Setup completed in $(date)"
 }
 
