@@ -32,10 +32,12 @@ OPTIONS:
 
 DESCRIPTION:
     Sets up automated cron jobs for VaultWarden maintenance:
-    - Daily database backups (2:00 AM)
-    - Weekly full backups (Sunday 1:00 AM)
-    - Daily health checks (every 6 hours)
-    - Weekly container updates (Sunday 3:00 AM)
+    - Daily database backups (2:00 AM) with rclone sync and email
+    - Weekly full backups (Sunday 1:00 AM) with rclone sync and email
+    - Daily health checks (every 6 hours) with email on failure
+    - Weekly container updates (Sunday 3:00 AM) with email notification
+    - Monthly system updates (First Sunday 4:00 AM) with email and auto-reboot
+    - Weekly Cloudflare IP updates (Monday 5:00 AM)
 
 EXAMPLES:
     sudo ./cron-setup.sh           # Install cron jobs
@@ -64,7 +66,7 @@ validate_environment() {
     fi
 
     # Check required commands using library function
-    require_commands crontab || return 1
+    require_commands crontab rclone mail || return 1
 
     # Ensure project scripts are executable
     local scripts=("backup.sh" "health.sh" "update.sh")
@@ -130,25 +132,29 @@ install_vaultwarden_crons() {
 # VaultWarden-OCI-NG Automated Tasks
 # Generated on $(date)
 
-# Daily database backup at 2:00 AM
-0 2 * * * $real_user cd $PROJECT_ROOT && ./backup.sh --type db >/dev/null 2>&1
+# --- START P1: Add --rclone and --email to backup jobs ---
+# Daily database backup at 2:00 AM, with rclone sync and email
+0 2 * * * $real_user cd $PROJECT_ROOT && ./backup.sh --type db --rclone --email >/dev/null 2>&1
 
-# Weekly full backup on Sunday at 1:00 AM  
-0 1 * * 0 $real_user cd $PROJECT_ROOT && ./backup.sh --type full >/dev/null 2>&1
+# Weekly full backup on Sunday at 1:00 AM, with rclone sync and email
+0 1 * * 0 $real_user cd $PROJECT_ROOT && ./backup.sh --type full --rclone --email >/dev/null 2>&1
+# --- END P1 ---
 
-# Health check every 6 hours with auto-heal
-0 */6 * * * $real_user cd $PROJECT_ROOT && ./health.sh --auto-heal --quiet >/dev/null 2>&1
+# --- START P2: Add --email-alert to health check ---
+# Health check every 6 hours with auto-heal and email on failure
+0 */6 * * * $real_user cd $PROJECT_ROOT && ./health.sh --auto-heal --quiet --email-alert >/dev/null 2>&1
+# --- END P2 ---
 
-# Weekly container updates on Sunday at 3:00 AM
+# --- START P3: Update job (already uses --force for auto-reboot) ---
+# Weekly container updates on Sunday at 3:00 AM (sends email)
 0 3 * * 0 $real_user cd $PROJECT_ROOT && ./update.sh --type containers --force >/dev/null 2>&1
 
-# Monthly system updates on first Sunday at 4:00 AM
+# Monthly system updates on first Sunday at 4:00 AM (sends email, auto-reboots)
 0 4 1-7 * 0 root cd $PROJECT_ROOT && ./update.sh --type system --force >/dev/null 2>&1
+# --- END P3 ---
 
-# --- FIX (H1): Add Cloudflare IP update cron job ---
 # Weekly Cloudflare IP update on Monday at 5:00 AM (runs as root)
 0 5 * * 1 root (cd $PROJECT_ROOT && CF_IPS_V4=\$(curl -sL https://www.cloudflare.com/ips-v4) && CF_IPS_V6=\$(curl -sL https://www.cloudflare.com/ips-v6) && echo -e "# Cloudflare IP ranges (auto-updated \$(date -uIs))\n@cloudflare {\n    # Cloudflare IPv4 ranges\n    remote_ip \$CF_IPS_V4\n    # Cloudflare IPv6 ranges\n    remote_ip \$CF_IPS_V6\n}" > caddy/cloudflare-ips.caddy.new && chown --reference=caddy/cloudflare-ips.caddy caddy/cloudflare-ips.caddy.new && mv caddy/cloudflare-ips.caddy.new caddy/cloudflare-ips.caddy && docker compose -f $PROJECT_ROOT/docker-compose.yml exec -T caddy caddy reload) >/dev/null 2>&1
-# --- END FIX ---
 
 EOF
 
@@ -376,11 +382,11 @@ main() {
         log_success "Cron setup completed!"
         echo ""
         echo "Scheduled Tasks:"
-        echo "  • Daily DB backup: 2:00 AM"
-        echo "  • Weekly full backup: Sunday 1:00 AM"  
-        echo "  • Health check: Every 6 hours"
-        echo "  • Container updates: Sunday 3:00 AM"
-        echo "  • System updates: First Sunday 4:00 AM"
+        echo "  • Daily DB backup: 2:00 AM (with Rclone sync & email)"
+        echo "  • Weekly full backup: Sunday 1:00 AM (with Rclone sync & email)"  
+        echo "  • Health check: Every 6 hours (with email on failure)"
+        echo "  • Container updates: Sunday 3:00 AM (with email notification)"
+        echo "  • System updates: First Sunday 4:00 AM (with email & auto-reboot)"
         echo "  • Cloudflare IP updates: Monday 5:00 AM"
         echo ""
         echo "Management Commands:"
