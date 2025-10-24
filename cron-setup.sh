@@ -145,6 +145,11 @@ install_vaultwarden_crons() {
 # Monthly system updates on first Sunday at 4:00 AM
 0 4 1-7 * 0 root cd $PROJECT_ROOT && ./update.sh --type system --force >/dev/null 2>&1
 
+# --- FIX (H1): Add Cloudflare IP update cron job ---
+# Weekly Cloudflare IP update on Monday at 5:00 AM (runs as root)
+0 5 * * 1 root (cd $PROJECT_ROOT && CF_IPS_V4=\$(curl -sL https://www.cloudflare.com/ips-v4) && CF_IPS_V6=\$(curl -sL https://www.cloudflare.com/ips-v6) && echo -e "# Cloudflare IP ranges (auto-updated \$(date -uIs))\n@cloudflare {\n    # Cloudflare IPv4 ranges\n    remote_ip \$CF_IPS_V4\n    # Cloudflare IPv6 ranges\n    remote_ip \$CF_IPS_V6\n}" > caddy/cloudflare-ips.caddy.new && chown --reference=caddy/cloudflare-ips.caddy caddy/cloudflare-ips.caddy.new && mv caddy/cloudflare-ips.caddy.new caddy/cloudflare-ips.caddy && docker compose -f $PROJECT_ROOT/docker-compose.yml exec -T caddy caddy reload) >/dev/null 2>&1
+# --- END FIX ---
+
 EOF
 
     if [[ "$DRY_RUN" == "true" ]]; then
@@ -376,6 +381,7 @@ main() {
         echo "  • Health check: Every 6 hours"
         echo "  • Container updates: Sunday 3:00 AM"
         echo "  • System updates: First Sunday 4:00 AM"
+        echo "  • Cloudflare IP updates: Monday 5:00 AM"
         echo ""
         echo "Management Commands:"
         echo "  • View cron jobs: sudo crontab -l"
