@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 # setup.sh - Complete VaultWarden-OCI-NG system setup with library integration
-# Corrected version addressing v4 review feedback
 
 set -euo pipefail
 
@@ -398,6 +397,8 @@ COMPOSE_PROJECT_NAME=vaultwarden
 VAULTWARDEN_VERSION=1.30.5
 CADDY_VERSION=2.8.4
 FAIL2BAN_VERSION=1.1.0
+# --- FIX (C4): Add DDCLIENT_VERSION ---
+DDCLIENT_VERSION=3.11.2
 
 # VaultWarden Configuration
 VAULTWARDEN_DATA_FOLDER=$state_dir/data
@@ -419,9 +420,18 @@ BACKUP_ENCRYPTION=age
 DOCKER_NETWORK_NAME=vaultwarden_network
 
 # Resource Limits (for small VMs)
-VAULTWARDEN_MEMORY_LIMIT=512m
+# --- FIX (H4): Increased memory for 6GB RAM / 10 users ---
+VAULTWARDEN_MEMORY_LIMIT=1g
 CADDY_MEMORY_LIMIT=128m
 FAIL2BAN_MEMORY_LIMIT=64m
+
+# --- FIX (C4): Add required env vars for ddclient/fail2ban ---
+# --- Cloudflare & DDClient (REQUIRED) ---
+# Find this on your Cloudflare dashboard (REQUIRED for fail2ban/ddclient)
+CLOUDFLARE_ZONE_ID=CHANGE_ME
+# The full domain name to update (e.g., $DOMAIN)
+DDCLIENT_HOSTNAME=$DOMAIN
+# --- END FIX ---
 
 # Optional: SMTP Configuration (configure in secrets)
 # SMTP_HOST=smtp.example.com
@@ -657,7 +667,7 @@ main() {
     # Execute setup steps
     install_dependencies || exit 1
     configure_firewall || exit 1
-    setup_directories || exit 1
+    setup_ directories || exit 1
     setup_age_keys || exit 1
     setup_sops_config || exit 1
     setup_environment || exit 1
@@ -678,8 +688,10 @@ main() {
     echo "Next steps:"
     echo "  1. Update secrets: ./edit-secrets.sh"
     echo "     • CRITICAL: Set admin_basic_auth_hash for Caddy admin protection"
+    echo "     • CRITICAL: Set cloudflare_api_token"
     echo "     • Configure SMTP password if using email notifications"
     echo "  2. Review configuration: nano .env"
+    echo "     • CRITICAL: Set CLOUDFLARE_ZONE_ID"
     echo "  3. Start services: ./startup.sh"
     echo "  4. Setup automation: sudo ./cron-setup.sh"
     echo "  5. Run health check: ./health.sh --comprehensive"
@@ -688,6 +700,7 @@ main() {
     echo "Admin panel: https://$DOMAIN/admin (protected by basic auth)"
     echo ""
     log_warn "IMPORTANT: The admin panel requires admin_basic_auth_hash to be configured!"
+    log_warn "IMPORTANT: The stack requires CLOUDFLARE_ZONE_ID and cloudflare_api_token to function!"
     log_info "Setup completed in $(date)"
 }
 
