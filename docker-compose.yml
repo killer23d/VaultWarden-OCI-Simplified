@@ -65,7 +65,8 @@ services:
     environment:
       - DOMAIN=${DOMAIN}
       - EMAIL=${ADMIN_EMAIL}
-      - CLOUDFLARE_API_TOKEN_FILE=/run/secrets/cloudflare_api_token
+      - ADMIN_BASIC_AUTH_HASH=${ADMIN_BASIC_AUTH_HASH}
+      - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN:-}
 
     ports:
       - "80:80"
@@ -73,12 +74,10 @@ services:
 
     volumes:
       - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./caddy/cloudflare-ips.caddy:/etc/caddy/cloudflare-ips.caddy:ro
       - ${PROJECT_STATE_DIR:-/var/lib/vaultwarden}/caddy/data:/data:rw
       - ${PROJECT_STATE_DIR:-/var/lib/vaultwarden}/caddy/config:/config:rw
       - ${PROJECT_STATE_DIR:-/var/lib/vaultwarden}/logs/caddy:/logs:rw
-
-    secrets:
-      - cloudflare_api_token
 
     depends_on:
       vaultwarden:
@@ -149,8 +148,6 @@ secrets:
     file: ./secrets/.docker_secrets/smtp_password
   push_installation_key:
     file: ./secrets/.docker_secrets/push_installation_key
-  cloudflare_api_token:
-    file: ./secrets/.docker_secrets/cloudflare_api_token
 
 # Network configuration
 networks:
