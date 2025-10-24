@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # setup.sh - Complete VaultWarden-OCI-NG system setup with library integration
+# Corrected version addressing v4 review feedback
 
 set -euo pipefail
 
@@ -44,7 +45,7 @@ EXAMPLES:
 
 DESCRIPTION:
     Complete system setup including:
-    - System dependencies (Docker, Age, SOPS)
+    - System dependencies (Docker, Age, SOPS, Rclone, Mailutils)
     - Firewall configuration
     - Age encryption keys
     - Environment configuration
@@ -144,8 +145,10 @@ install_dependencies() {
         return 1
     }
 
+    # --- START P1/P2: Add rclone and mailutils ---
     # Required packages
-    local packages=("docker.io" "docker-compose-plugin" "age" "sops" "ufw" "curl" "jq" "sqlite3" "gzip" "tar" "cron")
+    local packages=("docker.io" "docker-compose-plugin" "age" "sops" "ufw" "curl" "jq" "sqlite3" "gzip" "tar" "cron" "rclone" "mailutils")
+    # --- END P1/P2 ---
     local missing_packages=()
 
     # Check which packages are missing
@@ -372,7 +375,7 @@ setup_environment() {
         else
             log_warn ".env file already exists"
             read -p "Overwrite existing configuration? (y/N): " overwrite_env
-            if [[ ! "$overwrite_env" =~ ^[Yy]$ ]]; then
+            if [[ ! "$overwrite_env" =~ ^[Nn]$ ]]; then
                 log_info "Keeping existing .env file"
                 return 0
             fi
@@ -397,7 +400,6 @@ COMPOSE_PROJECT_NAME=vaultwarden
 VAULTWARDEN_VERSION=1.30.5
 CADDY_VERSION=2.8.4
 FAIL2BAN_VERSION=1.1.0
-# --- FIX (C4): Add DDCLIENT_VERSION ---
 DDCLIENT_VERSION=3.11.2
 
 # VaultWarden Configuration
@@ -415,23 +417,24 @@ FAIL2BAN_LOG_LEVEL=INFO
 # Backup Configuration
 BACKUP_RETENTION_DAYS=30
 BACKUP_ENCRYPTION=age
+# --- START P1: Add Rclone config ---
+# Rclone remote name (configure with 'rclone config')
+RCLONE_REMOTE_NAME=MyCloudStorage
+# --- END P1 ---
 
 # Network Configuration
 DOCKER_NETWORK_NAME=vaultwarden_network
 
 # Resource Limits (for small VMs)
-# --- FIX (H4): Increased memory for 6GB RAM / 10 users ---
 VAULTWARDEN_MEMORY_LIMIT=1g
 CADDY_MEMORY_LIMIT=128m
 FAIL2BAN_MEMORY_LIMIT=64m
 
-# --- FIX (C4): Add required env vars for ddclient/fail2ban ---
 # --- Cloudflare & DDClient (REQUIRED) ---
 # Find this on your Cloudflare dashboard (REQUIRED for fail2ban/ddclient)
 CLOUDFLARE_ZONE_ID=CHANGE_ME
 # The full domain name to update (e.g., $DOMAIN)
 DDCLIENT_HOSTNAME=$DOMAIN
-# --- END FIX ---
 
 # Optional: SMTP Configuration (configure in secrets)
 # SMTP_HOST=smtp.example.com
@@ -667,7 +670,7 @@ main() {
     # Execute setup steps
     install_dependencies || exit 1
     configure_firewall || exit 1
-    setup_ directories || exit 1
+    setup_directories || exit 1
     setup_age_keys || exit 1
     setup_sops_config || exit 1
     setup_environment || exit 1
@@ -692,15 +695,18 @@ main() {
     echo "     • Configure SMTP password if using email notifications"
     echo "  2. Review configuration: nano .env"
     echo "     • CRITICAL: Set CLOUDFLARE_ZONE_ID"
-    echo "  3. Start services: ./startup.sh"
-    echo "  4. Setup automation: sudo ./cron-setup.sh"
-    echo "  5. Run health check: ./health.sh --comprehensive"
+    echo "     • CRITICAL: Set RCLONE_REMOTE_NAME"
+    echo "  3. Configure Rclone: rclone config (for the user '$real_user')"
+    echo "  4. Start services: ./startup.sh"
+    echo "  5. Setup automation: sudo ./cron-setup.sh"
+    echo "  6. Run health check: ./health.sh --comprehensive"
     echo ""
     echo "Your VaultWarden will be available at: https://$DOMAIN"
     echo "Admin panel: https://$DOMAIN/admin (protected by basic auth)"
     echo ""
     log_warn "IMPORTANT: The admin panel requires admin_basic_auth_hash to be configured!"
     log_warn "IMPORTANT: The stack requires CLOUDFLARE_ZONE_ID and cloudflare_api_token to function!"
+    log_warn "IMPORTANT: Offsite backup requires rclone to be configured and RCLONE_REMOTE_NAME to be set!"
     log_info "Setup completed in $(date)"
 }
 
