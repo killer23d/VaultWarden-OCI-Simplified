@@ -57,11 +57,19 @@ services:
       - push_installation_key
 
     healthcheck:
+      # --- FIX (H3): Tuned for ARM ---
       test: ["CMD", "curl", "-f", "http://localhost:80/alive"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 30s
+      interval: 60s
+      timeout: 15s
+      retries: 5
+      start_period: 60s
+
+    logging:
+      # --- FIX (C5): Add Log Rotation ---
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
     deploy:
       resources:
@@ -107,11 +115,19 @@ services:
         condition: service_healthy
 
     healthcheck:
+      # --- FIX (H3): Tuned for ARM ---
       test: ["CMD", "caddy", "version"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 10s
+      interval: 60s
+      timeout: 15s
+      retries: 5
+      start_period: 30s
+
+    logging:
+      # --- FIX (C5): Add Log Rotation ---
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
     deploy:
       resources:
@@ -154,11 +170,19 @@ services:
       - NET_RAW
 
     healthcheck:
+      # --- FIX (H3): Tuned for ARM ---
       test: ["CMD-SHELL", "fail2ban-client ping"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 30s
+      interval: 60s
+      timeout: 15s
+      retries: 5
+      start_period: 60s
+
+    logging:
+      # --- FIX (C5): Add Log Rotation ---
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
     deploy:
       resources:
@@ -192,12 +216,20 @@ services:
       - cloudflare_api_token
 
     healthcheck:
+      # --- FIX (H3): Tuned for ARM ---
       test: ["CMD-SHELL", "pidof ddclient"]
-      interval: 60s
-      timeout: 10s
-      retries: 3
-      start_period: 30s
+      interval: 90s
+      timeout: 15s
+      retries: 5
+      start_period: 60s
       
+    logging:
+      # --- FIX (C5): Add Log Rotation ---
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
     deploy:
       resources:
         limits:
@@ -233,4 +265,3 @@ networks:
     ipam:
       config:
         - subnet: 172.20.0.0/16
-
