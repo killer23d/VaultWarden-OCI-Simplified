@@ -93,7 +93,7 @@ check_docker_health() {
 check_container_health() {
     [[ "$QUIET" != "true" ]] && log_info "Checking container health..."
 
-    local services=("vaultwarden" "caddy" "fail2ban")
+    local services=("vaultwarden" "caddy" "fail2ban" "ddclient")
     local unhealthy_services=()
     local stopped_services=()
 
@@ -268,7 +268,7 @@ auto_heal_containers() {
     log_info "Attempting to heal container issues..."
 
     # Get list of services that need healing
-    local services=("vaultwarden" "caddy" "fail2ban")
+    local services=("vaultwarden" "caddy" "fail2ban" "ddclient")
     local services_to_heal=()
 
     for service in "${services[@]}"; do
@@ -383,3 +383,4 @@ main() {
 }
 
 main "$@"
+
