@@ -37,7 +37,7 @@ DESCRIPTION:
     - Daily health checks (every 6 hours) with email on failure
     - Weekly container updates (Sunday 3:00 AM) with email notification
     - Monthly system updates (First Sunday 4:00 AM) with email and auto-reboot
-    - Weekly Cloudflare IP updates (Monday 5:00 AM)
+    - Weekly Cloudflare IP updates (Monday 5:00 AM) with email on failure
 
 EXAMPLES:
     sudo ./cron-setup.sh           # Install cron jobs
@@ -66,12 +66,17 @@ validate_environment() {
     fi
 
     # Check required commands using library function
-    require_commands crontab rclone mail || return 1
+    # --- FIX: Added 'docker' for Cloudflare IP update script ---
+    require_commands crontab rclone mail docker || return 1
 
     # Ensure project scripts are executable
-    local scripts=("backup.sh" "health.sh" "update.sh")
+    # --- FIX: Added 'update-cloudflare-ips.sh' ---
+    local scripts=("backup.sh" "health.sh" "update.sh" "update-cloudflare-ips.sh")
     for script in "${scripts[@]}"; do
-        if [[ ! -x "$PROJECT_ROOT/$script" ]]; then
+        if [[ ! -f "$PROJECT_ROOT/$script" ]]; then
+           log_error "Required script not found: $script"
+           return 1
+        elif [[ ! -x "$PROJECT_ROOT/$script" ]]; then
             log_warn "Making script executable: $script"
             chmod +x "$PROJECT_ROOT/$script"
         fi
@@ -132,29 +137,25 @@ install_vaultwarden_crons() {
 # VaultWarden-OCI-NG Automated Tasks
 # Generated on $(date)
 
-# --- START P1: Add --rclone and --email to backup jobs ---
 # Daily database backup at 2:00 AM, with rclone sync and email
 0 2 * * * $real_user cd $PROJECT_ROOT && ./backup.sh --type db --rclone --email >/dev/null 2>&1
 
 # Weekly full backup on Sunday at 1:00 AM, with rclone sync and email
 0 1 * * 0 $real_user cd $PROJECT_ROOT && ./backup.sh --type full --rclone --email >/dev/null 2>&1
-# --- END P1 ---
 
-# --- START P2: Add --email-alert to health check ---
 # Health check every 6 hours with auto-heal and email on failure
 0 */6 * * * $real_user cd $PROJECT_ROOT && ./health.sh --auto-heal --quiet --email-alert >/dev/null 2>&1
-# --- END P2 ---
 
-# --- START P3: Update job (already uses --force for auto-reboot) ---
 # Weekly container updates on Sunday at 3:00 AM (sends email)
 0 3 * * 0 $real_user cd $PROJECT_ROOT && ./update.sh --type containers --force >/dev/null 2>&1
 
 # Monthly system updates on first Sunday at 4:00 AM (sends email, auto-reboots)
 0 4 1-7 * 0 root cd $PROJECT_ROOT && ./update.sh --type system --force >/dev/null 2>&1
-# --- END P3 ---
 
-# Weekly Cloudflare IP update on Monday at 5:00 AM (runs as root)
-0 5 * * 1 root (cd $PROJECT_ROOT && CF_IPS_V4=\$(curl -sL https://www.cloudflare.com/ips-v4) && CF_IPS_V6=\$(curl -sL https://www.cloudflare.com/ips-v6) && echo -e "# Cloudflare IP ranges (auto-updated \$(date -uIs))\n@cloudflare {\n    # Cloudflare IPv4 ranges\n    remote_ip \$CF_IPS_V4\n    # Cloudflare IPv6 ranges\n    remote_ip \$CF_IPS_V6\n}" > caddy/cloudflare-ips.caddy.new && chown --reference=caddy/cloudflare-ips.caddy caddy/cloudflare-ips.caddy.new && mv caddy/cloudflare-ips.caddy.new caddy/cloudflare-ips.caddy && docker compose -f $PROJECT_ROOT/docker-compose.yml exec -T caddy caddy reload) >/dev/null 2>&1
+# --- FIX: Use dedicated script for Cloudflare IP update ---
+# Weekly Cloudflare IP update on Monday at 5:00 AM (runs as root, sends email on failure)
+0 5 * * 1 root cd $PROJECT_ROOT && ./update-cloudflare-ips.sh >> $PROJECT_ROOT/logs/cron.log 2>&1
+# --- END FIX ---
 
 EOF
 
@@ -169,6 +170,9 @@ EOF
     current_crons=$(get_current_crontab)
     temp_file=$(mktemp)
     setup_cleanup_trap "rm -f '$temp_file'"
+
+    # Ensure log directory exists for cron output
+    ensure_dir "$PROJECT_ROOT/logs" 755 "$real_user:$real_user"
 
     # Remove any existing VaultWarden crons first
     if [[ -n "$current_crons" ]]; then
@@ -230,6 +234,9 @@ setup_log_rotation() {
     local logrotate_conf="/etc/logrotate.d/vaultwarden"
     local state_dir
     state_dir=$(get_config_value "PROJECT_STATE_DIR" "/var/lib/vaultwarden")
+    local real_user
+    real_user=$(get_real_user)
+
 
     if [[ "$DRY_RUN" == "true" ]]; then
         log_info "[DRY RUN] Would create logrotate configuration: $logrotate_conf"
@@ -237,9 +244,6 @@ setup_log_rotation() {
     fi
 
     # Create logrotate configuration
-    local real_user
-    real_user=$(get_real_user)
-
     cat > "$logrotate_conf" << EOF
 # VaultWarden-OCI-NG Log Rotation
 $state_dir/logs/*/*.log {
@@ -251,12 +255,23 @@ $state_dir/logs/*/*.log {
     notifempty
     create 644 $real_user $real_user
     postrotate
-        # Send HUP signal to containers to reopen log files
-        docker compose -f $PROJECT_ROOT/docker-compose.yml kill -s HUP caddy || true
+        # Send HUP signal to containers to reopen log files if needed
+        # docker compose -f $PROJECT_ROOT/docker-compose.yml kill -s HUP caddy || true
     endscript
 }
 
-# Backup logs
+# Rotate cron job output log
+$PROJECT_ROOT/logs/cron.log {
+    weekly
+    rotate 4
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 644 $real_user $real_user
+}
+
+# Rotate project backup script logs (if any are created)
 $PROJECT_ROOT/backups/*.log {
     weekly
     rotate 4
@@ -267,6 +282,10 @@ $PROJECT_ROOT/backups/*.log {
 EOF
 
     log_success "Log rotation configured: $logrotate_conf"
+    # Ensure logrotate runs daily if needed
+    if [[ ! -f /etc/cron.daily/logrotate ]]; then
+        log_warn "Logrotate daily cron job may not be configured on this system."
+    fi
     return 0
 }
 
@@ -312,7 +331,7 @@ ensure_cron_service() {
 validate_scripts() {
     log_info "Validating automation scripts..."
 
-    local scripts=("backup.sh" "health.sh" "update.sh")
+    local scripts=("backup.sh" "health.sh" "update.sh" "update-cloudflare-ips.sh")
     local missing_scripts=()
     local non_executable=()
 
@@ -383,17 +402,19 @@ main() {
         echo ""
         echo "Scheduled Tasks:"
         echo "  • Daily DB backup: 2:00 AM (with Rclone sync & email)"
-        echo "  • Weekly full backup: Sunday 1:00 AM (with Rclone sync & email)"  
+        echo "  • Weekly full backup: Sunday 1:00 AM (with Rclone sync & email)"
         echo "  • Health check: Every 6 hours (with email on failure)"
         echo "  • Container updates: Sunday 3:00 AM (with email notification)"
         echo "  • System updates: First Sunday 4:00 AM (with email & auto-reboot)"
-        echo "  • Cloudflare IP updates: Monday 5:00 AM"
+        echo "  • Cloudflare IP updates: Monday 5:00 AM (with email on failure)"
         echo ""
         echo "Management Commands:"
         echo "  • View cron jobs: sudo crontab -l"
-        echo "  • Check cron logs: sudo journalctl -u cron"
+        echo "  • Check cron logs: sudo less /var/log/syslog | grep CRON or journalctl -u cron"
+        echo "  • Check project cron logs: less $PROJECT_ROOT/logs/cron.log"
         echo "  • Manual health check: ./health.sh --comprehensive"
     fi
 }
 
 main "$@"
+
