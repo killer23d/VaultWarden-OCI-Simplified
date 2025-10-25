@@ -175,26 +175,7 @@ pull_images() {
     fi
 }
 
-# Check if service has image updates available
-has_image_updates() {
-    local service="$1"
-
-    require_docker || return 1
-
-    # Get current running image ID
-    local current_id new_id
-    current_id=$(docker compose ps -q "$service" 2>/dev/null | xargs -r docker inspect --format '{{.Image}}' 2>/dev/null | head -1)
-
-    # Pull latest and get new image ID
-    docker compose pull "$service" >/dev/null 2>&1 || return 1
-
-    local image_name
-    image_name=$(docker compose config | grep -A 5 "$service:" | grep "image:" | awk '{print $2}' | head -1)
-    new_id=$(docker images --format "{{.ID}}" "$image_name" | head -1)
-
-    # Compare IDs (first 12 characters)
-    [[ "${current_id:0:12}" != "${new_id:0:12}" ]]
-}
+# --- FIX #6: Removed has_image_updates function ---
 
 # --- Container Execution ---
 
@@ -320,8 +301,8 @@ validate_compose_file() {
 export -f check_docker_available check_compose_available require_docker
 export -f get_service_status is_service_running get_service_health is_service_healthy
 export -f start_services stop_services restart_services recreate_services
-export -f pull_images has_image_updates exec_in_service run_in_service
+export -f pull_images exec_in_service run_in_service
 export -f cleanup_containers cleanup_images cleanup_volumes cleanup_networks cleanup_docker_system
-export -f get_service_logs follow_service_logs wait_for_service_ready validate_composite_file
+export -f get_service_logs follow_service_logs wait_for_service_ready validate_compose_file
 
 log_debug "Docker library loaded successfully" 2>/dev/null || true
