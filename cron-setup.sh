@@ -34,12 +34,13 @@ OPTIONS:
 
 DESCRIPTION:
     Sets up automated cron jobs for VaultWarden maintenance:
-    - Weekly maintenance (Sunday 00:00) - Prunes old backups, logs, docker artifacts
-    - Daily database backups (2:00 AM) with rclone sync
-    - Weekly full backups (Sunday 1:00 AM) with rclone sync
+    - Weekly maintenance (Sunday 00:00) - Prunes old backups/logs
+    - Daily database backups (2:00 AM) with rclone sync and email
+    - Weekly full backups (Sunday 1:00 AM) with rclone sync and email
+    - Quarterly DB VACUUM (1st Sunday Jan/Apr/Jul/Oct 1:00 AM)
     - Daily health checks (every 6 hours) with email on failure
-    - Weekly container updates (Sunday 3:00 AM) with email on failure
-    - Monthly system updates (First Sunday 4:00 AM) with email on failure
+    - Weekly container updates (Sunday 3:00 AM) with email notification
+    - Monthly system updates (First Sunday 4:00 AM) with email and auto-reboot
     - Weekly Cloudflare IP updates (Monday 5:00 AM) with email on failure
 
 EXAMPLES:
@@ -69,11 +70,11 @@ validate_environment() {
     fi
 
     # Check required commands using library function
-    # --- FIX: Added maintenance.sh ---
     require_commands crontab rclone mail docker || return 1
 
     # Ensure project scripts are executable
-    local scripts=("backup.sh" "health.sh" "update.sh" "update-cloudflare-ips.sh" "maintenance.sh")
+    # --- FIX: Added maintenance.sh and db-maint.sh ---
+    local scripts=("backup.sh" "health.sh" "update.sh" "update-cloudflare-ips.sh" "maintenance.sh" "db-maint.sh")
     for script in "${scripts[@]}"; do
         if [[ ! -f "$PROJECT_ROOT/$script" ]]; then
            log_error "Required script not found: $script"
@@ -136,34 +137,37 @@ install_vaultwarden_crons() {
     # Define cron jobs
     local cron_jobs
     # --- P11 FIX: Explicitly source .env in each job ---
-    # --- FIX #1: Added maintenance.sh cron job ---
-    # --- FIX #5: Removed --email from backup jobs ---
     # Redirect all cron output to logs/cron.log
     read -r -d '' cron_jobs << EOF || true
 # VaultWarden-OCI-NG Automated Tasks
 # Generated on $(date)
 
+# --- FIX: Added Weekly Maintenance Job (Prevents Disk Full) ---
 # Weekly maintenance (prune old backups/logs/docker) on Sunday 00:00
 0 0 * * 0 root cd $PROJECT_ROOT && source .env && ./maintenance.sh --type standard --force >> $PROJECT_ROOT/logs/cron.log 2>&1
 
-# Daily database backup at 2:00 AM, with rclone sync
-0 2 * * * $real_user cd $PROJECT_ROOT && source .env && ./backup.sh --type db --rclone >> $PROJECT_ROOT/logs/cron.log 2>&1
+# Daily database backup at 2:00 AM, with rclone sync and email
+0 2 * * * $real_user cd $PROJECT_ROOT && source .env && ./backup.sh --type db --rclone --email >> $PROJECT_ROOT/logs/cron.log 2>&1
 
-# Weekly full backup on Sunday at 1:00 AM, with rclone sync
-0 1 * * 0 $real_user cd $PROJECT_ROOT && source .env && ./backup.sh --type full --rclone >> $PROJECT_ROOT/logs/cron.log 2>&1
+# Weekly full backup on Sunday at 1:00 AM, with rclone sync and email
+0 1 * * 0 $real_user cd $PROJECT_ROOT && source .env && ./backup.sh --type full --rclone --email >> $PROJECT_ROOT/logs/cron.log 2>&1
+
+# --- FIX: Added Quarterly Database Maintenance ---
+# Quarterly database maintenance (VACUUM, etc) on the 1st Sunday of Jan/Apr/Jul/Oct at 1:00 AM
+0 1 1-7 1,4,7,10 0 root cd $PROJECT_ROOT && source .env && ./db-maint.sh --force >> $PROJECT_ROOT/logs/cron.log 2>&1
 
 # Health check every 6 hours with auto-heal and email on failure
 0 */6 * * * $real_user cd $PROJECT_ROOT && source .env && ./health.sh --auto-heal --quiet --email-alert >> $PROJECT_ROOT/logs/cron.log 2>&1
 
-# Weekly container updates on Sunday at 3:00 AM (sends email on failure)
+# Weekly container updates on Sunday at 3:00 AM (sends email)
 0 3 * * 0 $real_user cd $PROJECT_ROOT && source .env && ./update.sh --type containers --force >> $PROJECT_ROOT/logs/cron.log 2>&1
 
-# Monthly system updates on first Sunday at 4:00 AM (sends email on failure, auto-reboots)
+# Monthly system updates on first Sunday at 4:00 AM (sends email, auto-reboots)
 0 4 1-7 * 0 root cd $PROJECT_ROOT && source .env && ./update.sh --type system --force >> $PROJECT_ROOT/logs/cron.log 2>&1
 
 # Weekly Cloudflare IP update on Monday at 5:00 AM (runs as root, sends email on failure)
 0 5 * * 1 root cd $PROJECT_ROOT && source .env && ./update-cloudflare-ips.sh >> $PROJECT_ROOT/logs/cron.log 2>&1
-# --- END FIXES ---
+# --- END P11 FIX ---
 
 EOF
 
@@ -248,9 +252,7 @@ setup_log_rotation() {
     local real_group=$(id -g -n "$real_user") || real_group="$real_user"
     # P14 FIX: Get predictable container names from .env or defaults
     local compose_project_name=$(get_config_value "COMPOSE_PROJECT_NAME" "vaultwarden")
-    local fail2ban_container_name="${compose_project_name}_fail2ban"
-
-
+    
     if [[ "$DRY_RUN" == "true" ]]; then
         log_info "[DRY RUN] Would create logrotate configuration: $logrotate_conf"
         return 0
@@ -259,7 +261,7 @@ setup_log_rotation() {
     # Create logrotate configuration
     cat > "$logrotate_conf" << EOF
 # VaultWarden-OCI-NG Log Rotation
-# --- FIX #2: Removed Caddy log path ---
+# --- FIX: Removed Caddy logs (self-rotates) ---
 $state_dir/logs/vaultwarden/*.log $state_dir/logs/fail2ban/*.log {
     daily
     rotate 30
@@ -269,23 +271,22 @@ $state_dir/logs/vaultwarden/*.log $state_dir/logs/fail2ban/*.log {
     notifempty
     create 644 $real_user $real_group
     sharedscripts
-    # --- FIX #4: Robust postrotate script ---
     postrotate
-        if command -v docker >/dev/null 2>&1; then
-            # Get the COMPOSE_PROJECT_NAME from the .env file if it exists
-            if [[ -f "$PROJECT_ROOT/.env" ]]; then
-                PROJECT_NAME=\$(grep -E '^COMPOSE_PROJECT_NAME=' "$PROJECT_ROOT/.env" 2>/dev/null | cut -d= -f2)
-            fi
+        # --- FIX: Robust postrotate script ---
+        if command -v docker >/dev/null 2>&1 && [[ -f "$PROJECT_ROOT/.env" ]]; then
+            # Get the COMPOSE_PROJECT_NAME from the .env file
+            PROJECT_NAME=\$(grep -E '^COMPOSE_PROJECT_NAME=' "$PROJECT_ROOT/.env" | cut -d= -f2)
             PROJECT_NAME=\${PROJECT_NAME:-vaultwarden}
             
             # Use docker compose exec to find the container and flush logs
-            # Run in subshell to not affect logrotate's cwd
             (cd "$PROJECT_ROOT" && \
              docker compose -p "\$PROJECT_NAME" exec -T fail2ban fail2ban-client flushlogs >/dev/null 2>&1) || \
-             echo "\$(date) [vaultwarden-logrotate] Failed to flush fail2ban logs" >> /var/log/syslog
+             echo "Failed to flush fail2ban logs" >> /var/log/syslog
+        else
+            echo "Could not find docker or .env file, skipping fail2ban log flush" >> /var/log/syslog
         fi
+        # --- END FIX ---
     endscript
-    # --- END FIX #4 ---
 }
 
 # Rotate cron job output log
@@ -359,8 +360,8 @@ ensure_cron_service() {
 validate_scripts() {
     log_info "Validating automation scripts..."
 
-    # --- FIX: Added maintenance.sh ---
-    local scripts=("backup.sh" "health.sh" "update.sh" "update-cloudflare-ips.sh" "maintenance.sh")
+    # --- FIX: Added maintenance.sh and db-maint.sh ---
+    local scripts=("backup.sh" "health.sh" "update.sh" "update-cloudflare-ips.sh" "maintenance.sh" "db-maint.sh")
     local missing_scripts=()
     local non_executable=()
 
@@ -431,11 +432,12 @@ main() {
         echo ""
         echo "Scheduled Tasks:"
         echo "  • Weekly maintenance: Sunday 00:00 (Prunes old backups/logs)"
-        echo "  • Daily DB backup: 2:00 AM (with Rclone sync)"
-        echo "  • Weekly full backup: Sunday 1:00 AM (with Rclone sync)"
+        echo "  • Daily DB backup: 2:00 AM (with Rclone sync & email)"
+        echo "  • Weekly full backup: Sunday 1:00 AM (with Rclone sync & email)"
+        echo "  • Quarterly DB maintenance: 1st Sun of Jan/Apr/Jul/Oct at 1:00 AM"
         echo "  • Health check: Every 6 hours (with email on failure)"
-        echo "  • Container updates: Sunday 3:00 AM (with email on failure)"
-        echo "  • System updates: First Sunday 4:00 AM (with email on failure & auto-reboot)"
+        echo "  • Container updates: Sunday 3:00 AM (with email notification)"
+        echo "  • System updates: First Sunday 4:00 AM (with email & auto-reboot)"
         echo "  • Cloudflare IP updates: Monday 5:00 AM (with email on failure)"
         echo ""
         echo "Management Commands:"
@@ -447,3 +449,4 @@ main() {
 }
 
 main "$@"
+
