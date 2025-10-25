@@ -65,7 +65,7 @@ done
 # --- Validation ---
 validate_environment() {
     # Check required commands
-    require_commands age tar gzip || return 1
+    require_commands age tar gzip chown || return 1 # Added chown for P13
 
     # Check Docker availability for container operations
     require_docker || return 1
@@ -113,14 +113,20 @@ detect_backup_type() {
         *)
             # Try to peek inside the encrypted file to determine type
             log_info "Attempting to auto-detect backup type..."
+            local peek_content
+            peek_content=$(decrypt_file "$BACKUP_FILE" | tar -tf - 2>/dev/null || echo "")
 
-            if decrypt_file "$BACKUP_FILE" | tar -tf - 2>/dev/null | grep -q "docker-compose.yml\|RECOVERY.md"; then
-                if decrypt_file "$BACKUP_FILE" | tar -tf - 2>/dev/null | grep -q "RECOVERY.md\|kit-info.txt"; then
+            if [[ -n "$peek_content" ]]; then
+                 if echo "$peek_content" | grep -qE "(RECOVERY\.md|kit-info\.txt)"; then
                     echo "emergency"
-                else
-                    echo "full"
-                fi
+                 elif echo "$peek_content" | grep -qE "(\.env|docker-compose\.yml)"; then
+                     echo "full"
+                 else
+                     # Assume db if it doesn't look like full or emergency
+                     echo "db"
+                 fi
             else
+                log_warn "Could not decrypt or read archive to detect type, assuming 'db'"
                 echo "db"
             fi
             ;;
@@ -156,8 +162,8 @@ confirm_restore() {
         "full")
             echo "This will:"
             echo "  - Stop all services"
-            echo "  - Replace configuration files"
-            echo "  - Replace database and data"
+            echo "  - Replace configuration files (.env, compose, secrets, caddy, fail2ban)"
+            echo "  - Replace database and data directory"
             echo "  - Restart all services"
             echo ""
             echo "⚠️  All current configuration and data will be lost!"
@@ -165,8 +171,9 @@ confirm_restore() {
         "emergency")
             echo "This will:"
             echo "  - Stop all services"
-            echo "  - Replace ALL configuration and data"
-            echo "  - Overwrite secrets and keys"
+            echo "  - Replace ALL configuration and data in project directory"
+            echo "  - Overwrite secrets and Age keys"
+            echo "  - Replace database and data directory"
             echo "  - Restart all services"
             echo ""
             echo "⚠️  Complete system replacement - all current data will be lost!"
@@ -201,9 +208,10 @@ restore_database() {
     stop_services "vaultwarden" || log_warn "VaultWarden may not have been running"
 
     # Backup current database
-    local state_dir db_file
+    local state_dir db_file db_dir
     state_dir=$(get_config_value "PROJECT_STATE_DIR" "/var/lib/vaultwarden")
-    db_file="$state_dir/data/bwdata/db.sqlite3"
+    db_dir="$state_dir/data/bwdata"
+    db_file="$db_dir/db.sqlite3"
 
     if [[ -f "$db_file" ]]; then
         log_info "Backing up current database..."
@@ -211,15 +219,21 @@ restore_database() {
     fi
 
     # Ensure database directory exists
-    ensure_dir "$(dirname "$db_file")" 755
+    # --- P13 FIX: Get owner info ---
+    local real_user real_group owner
+    real_user=$(get_real_user)
+    real_group=$(id -g -n "$real_user") || real_group="$real_user"
+    owner="$real_user:$real_group"
+    ensure_dir "$db_dir" 700 "$owner" # Use 700 to match data dir permissions
 
     # Decrypt and restore database using library function
     log_info "Restoring database from backup..."
     if decrypt_file "$BACKUP_FILE" | gunzip > "$db_file"; then
         log_success "Database restored successfully"
 
-        # Set proper permissions
-        secure_file "$db_file" 644
+        # Set proper permissions and ownership
+        chown "$owner" "$db_file" || log_warn "Failed to set ownership on database file"
+        secure_file "$db_file" 600 || { log_error "Failed to set database permissions"; return 1; } # P16 FIX + use 600
 
         # Start VaultWarden service using library function
         log_info "Starting VaultWarden service..."
@@ -257,6 +271,12 @@ restore_full_system() {
         return 0
     fi
 
+    # --- P13 FIX: Get owner info ---
+    local real_user real_group owner
+    real_user=$(get_real_user)
+    real_group=$(id -g -n "$real_user") || real_group="$real_user"
+    owner="$real_user:$real_group"
+
     # Stop all services using library function
     log_info "Stopping all services..."
     stop_services || log_warn "Services may not have been running"
@@ -281,33 +301,54 @@ restore_full_system() {
     [[ -f docker-compose.yml ]] && cp docker-compose.yml "docker-compose.yml.$backup_suffix" || true
     [[ -d secrets ]] && cp -r secrets "secrets.$backup_suffix" || true
 
-    # Restore configuration files
+    # Restore configuration files from temp dir to project root
     log_info "Restoring configuration files..."
-
-    [[ -f "$temp_dir/.env" ]] && cp "$temp_dir/.env" . || log_warn ".env not found in backup"
-    [[ -f "$temp_dir/docker-compose.yml" ]] && cp "$temp_dir/docker-compose.yml" . || log_warn "docker-compose.yml not found in backup"
-    [[ -d "$temp_dir/secrets" ]] && cp -r "$temp_dir/secrets" . || log_warn "secrets/ not found in backup"
-    [[ -d "$temp_dir/caddy" ]] && cp -r "$temp_dir/caddy" . || log_warn "caddy/ not found in backup"
-    [[ -d "$temp_dir/fail2ban" ]] && cp -r "$temp_dir/fail2ban" . || log_warn "fail2ban/ not found in backup"
+    if [[ -d "$temp_dir" ]]; then
+        cp -a "$temp_dir"/* . 2>/dev/null || log_warn "Could not copy some config files"
+    fi
 
     # Restore data directory
     local state_dir
     state_dir=$(get_config_value "PROJECT_STATE_DIR" "/var/lib/vaultwarden")
     if [[ -d "$temp_dir/data" ]]; then
-        log_info "Restoring data directory..."
-        ensure_dir "$state_dir" 755
+        log_info "Restoring data directory to $state_dir/data..."
+        ensure_dir "$state_dir" 755 "$owner" # Ensure state dir exists with correct owner
 
         # Backup existing data
         [[ -d "$state_dir/data" ]] && mv "$state_dir/data" "$state_dir/data.$backup_suffix" || true
 
-        # Restore data
-        cp -r "$temp_dir/data" "$state_dir/" || log_warn "Failed to restore some data files"
+        # Move restored data from temp dir (already in project root now) to state dir
+        if [[ -d "./data" ]]; then
+            mv "./data" "$state_dir/" || log_warn "Failed to move data directory"
+        else
+             log_warn "Restored data directory not found in project root"
+        fi
     fi
 
-    # Set proper permissions using library functions
-    secure_file .env 600 2>/dev/null || true
-    secure_file secrets/secrets.yaml 600 2>/dev/null || true
-    secure_file secrets/keys/age-key.txt 600 2>/dev/null || true
+    # --- P13 FIX: Set ownership recursively ---
+    log_info "Setting ownership for restored files..."
+    if ! chown -R "$owner" .; then
+         log_warn "Failed to set ownership on some project files"
+    fi
+    if [[ -d "$state_dir/data" ]]; then
+        if ! chown -R "$owner" "$state_dir/data"; then
+             log_warn "Failed to set ownership on data directory"
+        fi
+    fi
+    # --- END P13 FIX ---
+
+    # Set secure permissions using library functions (after ownership)
+    secure_file .env 600 || { log_error "Failed to secure .env"; return 1; }
+    if [[ -f secrets/secrets.yaml ]]; then
+        secure_file secrets/secrets.yaml 600 || { log_error "Failed to secure secrets.yaml"; return 1; }
+    fi
+    if [[ -f secrets/keys/age-key.txt ]]; then
+        secure_file secrets/keys/age-key.txt 600 || { log_error "Failed to secure age-key.txt"; return 1; }
+    fi
+    # Ensure data directory has correct base permissions after potential overwrite
+    if [[ -d "$state_dir/data" ]]; then
+        chmod 700 "$state_dir/data" || log_warn "Failed to set permissions on data directory"
+    fi
 
     # Start services using library function
     log_info "Starting services..."
@@ -350,6 +391,12 @@ restore_emergency_kit() {
         return 0
     fi
 
+    # --- P13 FIX: Get owner info ---
+    local real_user real_group owner
+    real_user=$(get_real_user)
+    real_group=$(id -g -n "$real_user") || real_group="$real_user"
+    owner="$real_user:$real_group"
+
     # Create temporary restore directory
     local temp_dir
     temp_dir=$(mktemp -d)
@@ -386,32 +433,51 @@ restore_emergency_kit() {
     local backup_suffix="emergency-backup-$(date +%Y%m%d-%H%M%S)"
     log_info "Creating emergency backup of current state..."
 
-    ensure_dir "emergency-backups/$backup_suffix" 755
-    cp -r . "emergency-backups/$backup_suffix/" 2>/dev/null || true
+    ensure_dir "emergency-backups/$backup_suffix" 755 "$owner" # Ensure owner is correct
+    # Use cp -a to preserve permissions as much as possible during backup
+    cp -a . "emergency-backups/$backup_suffix/" 2>/dev/null || log_warn "Could not fully back up current state"
 
-    # Restore all components
+    # Restore all components from temp dir to project root
     log_info "Restoring complete system from emergency kit..."
-
-    # Configuration files
-    [[ -f "$temp_dir/.env" ]] && cp "$temp_dir/.env" .
-    [[ -f "$temp_dir/docker-compose.yml" ]] && cp "$temp_dir/docker-compose.yml" .
-    [[ -d "$temp_dir/secrets" ]] && cp -r "$temp_dir/secrets" .
-    [[ -d "$temp_dir/caddy" ]] && cp -r "$temp_dir/caddy" .
-    [[ -d "$temp_dir/fail2ban" ]] && cp -r "$temp_dir/fail2ban" .
-
-    # Data directory
-    local state_dir
-    state_dir=$(get_config_value "PROJECT_STATE_DIR" "/var/lib/vaultwarden")
-    if [[ -d "$temp_dir/data" ]]; then
-        ensure_dir "$state_dir" 755
-        rm -rf "$state_dir/data" 2>/dev/null || true
-        cp -r "$temp_dir/data" "$state_dir/"
+    if [[ -d "$temp_dir" ]]; then
+        # Copy with -a preserves permissions from the archive, then we fix owner/group
+        cp -a "$temp_dir"/* . 2>/dev/null || log_warn "Could not copy some files from kit"
     fi
 
-    # Set permissions using library functions
-    secure_file .env 600 2>/dev/null || true
-    secure_file secrets/secrets.yaml 600 2>/dev/null || true
-    secure_file secrets/keys/age-key.txt 600 2>/dev/null || true
+    # Restore data directory separately
+    local state_dir
+    state_dir=$(get_config_value "PROJECT_STATE_DIR" "/var/lib/vaultwarden")
+    if [[ -d "./data" ]]; then # Data was copied to project root first
+        log_info "Moving restored data directory to $state_dir/data..."
+        ensure_dir "$state_dir" 755 "$owner"
+        rm -rf "$state_dir/data" 2>/dev/null || true # Remove old one if exists
+        mv "./data" "$state_dir/" || log_warn "Failed to move data directory"
+    fi
+
+    # --- P13 FIX: Set ownership recursively ---
+    log_info "Setting ownership for restored files..."
+    if ! chown -R "$owner" .; then
+         log_warn "Failed to set ownership on some project files"
+    fi
+    if [[ -d "$state_dir/data" ]]; then
+        if ! chown -R "$owner" "$state_dir/data"; then
+             log_warn "Failed to set ownership on data directory"
+        fi
+    fi
+    # --- END P13 FIX ---
+
+    # Set secure permissions using library functions (after ownership)
+    secure_file .env 600 || { log_error "Failed to secure .env"; return 1; }
+    if [[ -f secrets/secrets.yaml ]]; then
+        secure_file secrets/secrets.yaml 600 || { log_error "Failed to secure secrets.yaml"; return 1; }
+    fi
+    if [[ -f secrets/keys/age-key.txt ]]; then
+        secure_file secrets/keys/age-key.txt 600 || { log_error "Failed to secure age-key.txt"; return 1; }
+    fi
+    # Ensure data directory has correct base permissions after potential overwrite
+    if [[ -d "$state_dir/data" ]]; then
+        chmod 700 "$state_dir/data" || log_warn "Failed to set permissions on data directory"
+    fi
 
     # Start services using library function
     log_info "Starting restored services..."
