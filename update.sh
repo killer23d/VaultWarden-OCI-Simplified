@@ -132,11 +132,13 @@ update_containers() {
     fi
     
     # Check current container versions
-    log_info "Current container versions:"
+    log_info "Current container versions (before pull):"
+    declare -A old_ids
     for service in $services; do
         local image current_id
         image=$(docker compose config | grep -A 10 "$service:" | grep "image:" | awk '{print $2}' | head -1)
-        current_id=$(docker images --format "table {{.Repository}}:{{.Tag}}\t{{.ID}}" | grep "$image" | awk '{print $2}' | head -1 || echo "unknown")
+        current_id=$(docker images --format "{{.ID}}" "$image" | head -1 || echo "not_found")
+        old_ids["$service"]="$current_id"
         log_info "  $service: $image ($current_id)"
     done
     
@@ -149,10 +151,21 @@ update_containers() {
         return 1
     fi
     
-    # Check if any images were updated
+    # --- FIX #6: More efficient update check ---
+    # Check if any images were updated by comparing old and new IDs
     local updated_services=()
+    log_info "Checking for updated images..."
     for service in $services; do
-        if has_image_updates "$service"; then
+        local image new_id
+        image=$(docker compose config | grep -A 10 "$service:" | grep "image:" | awk '{print $2}' | head -1)
+        new_id=$(docker images --format "{{.ID}}" "$image" | head -1 || echo "unknown")
+        
+        if [[ "${old_ids["$service"]}" != "$new_id" ]]; then
+             if [[ "${old_ids["$service"]}" == "not_found" ]]; then
+                log_info "  $service: New image pulled ($new_id)"
+             else
+                log_info "  $service: Image updated (${old_ids["$service"]} -> $new_id)"
+             fi
             updated_services+=("$service")
         fi
     done
@@ -161,6 +174,7 @@ update_containers() {
         log_success "All containers are already up to date"
         return 0
     fi
+    # --- END FIX #6 ---
     
     log_info "Services with updates available: ${updated_services[*]}"
     
@@ -422,7 +436,7 @@ main() {
         verify_system_health || log_warn "Post-update health check issues detected"
     fi
     
-    # --- START P2: Send Notification ---
+    # --- START FIX #5: Email on failure only ---
     echo ""
     if [[ $exit_code -eq 0 ]]; then
         if [[ "$reboot_required" == "true" ]]; then
@@ -431,15 +445,15 @@ main() {
             log_success "Update completed successfully"
         fi
         
-        log_info "Sending update notification email..."
-        send_notification_email "Update Completed: $UPDATE_TYPE" "$update_summary"
+        # No email on success
+        log_info "Update successful, no notification sent (per 'no news is good news' policy)."
 
     else
         log_error "Update failed"
         log_info "Sending update failure email..."
         send_notification_email "Update FAILED: $UPDATE_TYPE" "$update_summary"
     fi
-    # --- END P2 ---
+    # --- END FIX #5 ---
 
     echo ""
     echo "Update Summary:"
