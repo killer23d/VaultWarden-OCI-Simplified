@@ -104,7 +104,7 @@ encrypt_file() {
 # Decrypt file with Age using private key
 decrypt_file() {
     local encrypted_file="$1"
-    local output_file="$2" 
+    local output_file="$2"
     local private_key_file="${3:-$DEFAULT_AGE_KEY_FILE}"
 
     if [[ ! -f "$encrypted_file" ]]; then
@@ -228,26 +228,7 @@ is_sops_encrypted() {
     grep -q "sops:" "$file" 2>/dev/null
 }
 
-# --- Secrets Management ---
-
-# Get specific secret value
-get_secret() {
-    local key="$1"
-    local secrets_file="${2:-$DEFAULT_SECRETS_FILE}"
-
-    if [[ ! -f "$secrets_file" ]]; then
-        return 1
-    fi
-
-    if ! check_sops_available; then
-        return 1
-    fi
-
-    # Decrypt and extract specific key
-    # Note: This is the original fragile method, kept for prepare_environment_variables
-    # startup.sh (prepare_docker_secrets) should use the robust jq method
-    sops_decrypt "$secrets_file" | grep "^${key}:" | cut -d':' -f2- | sed 's/^[[:space:]]*//;s/^["''']*//;s/["''']*$//'
-}
+# --- P4 FIX: Removed get_secret function ---
 
 # --- Utility Functions ---
 
@@ -281,7 +262,8 @@ generate_hex_string() {
 export -f check_age_key generate_age_keypair get_public_key
 export -f encrypt_file decrypt_file encrypt_data decrypt_data
 export -f check_sops_available sops_encrypt sops_decrypt sops_edit is_sops_encrypted
-export -f get_secret
+# Removed get_secret from export
 export -f generate_secure_string generate_hex_string
 
 log_debug "Crypto library loaded successfully" 2>/dev/null || true
+
