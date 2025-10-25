@@ -44,10 +44,21 @@ update_firewall_rules() {
     ufw default deny incoming >/dev/null 2>&1
     ufw default allow outgoing >/dev/null 2>&1
     
+    # --- P7 FIX: Smart SSH Port Detection ---
     # Allow SSH (CRITICAL)
-    local ssh_port="${SSH_PORT:-22}"
+    # Priority: 1. $SSH_PORT env var (from .env), 2. sshd_config, 3. default 22
+    # Note: cron-setup.sh must load .env or this var must be in root's env
+    local ssh_port="${SSH_PORT:-}"
+    if [[ -z "$ssh_port" ]]; then
+        # Grep for the 'Port' directive, ignore comments, get last value
+        ssh_port=$(grep -E '^[[:space:]]*Port[[:space:]]+[0-9]+' /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' | tail -1)
+    fi
+    # Default to 22 if still empty
+    ssh_port="${ssh_port:-22}"
+    
     ufw allow "$ssh_port/tcp" comment "SSH" >/dev/null 2>&1
     log_info "Firewall rule added: Allow SSH on port $ssh_port"
+    # --- END P7 FIX ---
 
     # Add new Cloudflare IP rules
     local all_ips=()
@@ -170,6 +181,7 @@ main() {
     log_info "Updating Cloudflare IP ranges for Firewall and Caddy..."
 
     # Load environment needed for docker compose
+    # This will also load $SSH_PORT for the firewall function
     load_env_file || {
         log_error "Failed to load .env file. Cannot run docker compose."
         exit 1
