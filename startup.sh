@@ -78,6 +78,19 @@ prepare_docker_secrets() {
         log_error "Secrets file is not encrypted with SOPS"
         return 1
     fi
+    
+    # --- FIX #3: Robust secrets parsing with jq ---
+    if ! has_command jq; then
+        log_error "jq command not found. Cannot parse secrets."
+        log_info "Install with: sudo apt install jq"
+        return 1
+    fi
+
+    local decrypted_json
+    decrypted_json=$(sops -d --output-type json "secrets/secrets.yaml" 2>/dev/null) || {
+        log_error "Failed to decrypt secrets. Check age key and sops config."
+        return 1
+    }
 
     local secrets=("admin_token" "smtp_password" "push_installation_id" "push_installation_key" "admin_basic_auth_hash" "ddclient_api_token" "fail2ban_api_token")
     local secret_file_path
@@ -85,17 +98,23 @@ prepare_docker_secrets() {
     for secret in "${secrets[@]}"; do
         local value
         secret_file_path="$docker_secrets_dir/$secret"
-        if value=$(get_secret "$secret" 2>/dev/null) && [[ -n "$value" ]] && [[ "$value" != "CHANGE_ME"* ]]; then
+        
+        # Use jq to safely extract the value, defaulting to "CHANGE_ME" if null/missing
+        value=$(echo "$decrypted_json" | jq -r --arg secret "$secret" '.[$secret] // "CHANGE_ME"')
+
+        if [[ -n "$value" ]] && [[ "$value" != "CHANGE_ME" ]] && [[ "$value" != "null" ]]; then
             echo "$value" > "$secret_file_path"
-            # --- P16 FIX: Added error handling ---
-            secure_file "$secret_file_path" 600 || { log_error "Failed to secure temporary secret file: $secret"; return 1; }
         else
             echo "CHANGE_ME" > "$secret_file_path"
-            # --- P16 FIX: Added error handling ---
-            secure_file "$secret_file_path" 600 || { log_error "Failed to secure temporary secret file: $secret"; return 1; }
-            log_warn "Secret '$secret' not configured or has placeholder value"
+            # Only warn for the critical, user-facing tokens
+            if [[ "$secret" == "admin_basic_auth_hash" || "$secret" == "ddclient_api_token" || "$secret" == "fail2ban_api_token" ]]; then
+                log_warn "Secret '$secret' not configured or has placeholder value"
+            fi
         fi
+        
+        secure_file "$secret_file_path" 600 || { log_error "Failed to secure temporary secret file: $secret"; return 1; }
     done
+    # --- END FIX #3 ---
 
     log_success "Docker secrets prepared"
     return 0
@@ -244,4 +263,3 @@ main() {
 }
 
 main "$@"
-
