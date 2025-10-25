@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# update-cloudflare-ips.sh - Fetches Cloudflare IPs, updates Caddy config, and reloads Caddy.
-# Includes error handling and sends email notification ONLY on failure.
+# update-cloudflare-ips.sh - Fetches Cloudflare IPs, updates Caddy config,
+# reconfigures the UFW firewall, and reloads Caddy.
+# This script is designed to be idempotent and safe to run automatically.
 
 set -euo pipefail
 
@@ -10,40 +11,75 @@ PROJECT_ROOT="$SCRIPT_DIR"
 cd "$PROJECT_ROOT"
 
 # --- Source Libraries ---
+# Must source common.sh *before* init, but init must be called
 source "lib/common.sh"
 init_common_lib "$0"
 # docker lib needed for 'docker compose exec'
 source "lib/docker.sh"
 
-# --- Main Update Function ---
-update_cloudflare_ips() {
-    log_info "Updating Cloudflare IP ranges..."
+# --- Firewall Update Function ---
+# This function resets and applies all firewall rules based on new IPs
+update_firewall_rules() {
+    local cf_ips_v4="$1"
+    local cf_ips_v6="$2"
+    
+    if ! is_root; then
+        log_error "Firewall updates require root privileges."
+        log_info "Run this script with: sudo ./update-cloudflare-ips.sh"
+        return 1
+    fi
+    
+    if ! has_command ufw; then
+        log_warn "UFW command not found, skipping firewall update."
+        return 0 # Not a fatal error, just log and continue
+    fi
 
-    local cf_ips_v4 cf_ips_v6
+    log_info "Resetting UFW to apply new rules..."
+    ufw --force reset >/dev/null 2>&1 || {
+        log_error "Failed to reset UFW"
+        return 1
+    }
+    
+    # Apply defaults
+    ufw default deny incoming >/dev/null 2>&1
+    ufw default allow outgoing >/dev/null 2>&1
+    
+    # Allow SSH (CRITICAL)
+    local ssh_port="${SSH_PORT:-22}"
+    ufw allow "$ssh_port/tcp" comment "SSH" >/dev/null 2>&1
+    log_info "Firewall rule added: Allow SSH on port $ssh_port"
+
+    # Add new Cloudflare IP rules
+    local all_ips=()
+    # Read IPs into an array
+    while IFS= read -r ip; do [[ -n "$ip" ]] && all_ips+=("$ip"); done <<< "$cf_ips_v4"
+    while IFS= read -r ip; do [[ -n "$ip" ]] && all_ips+=("$ip"); done <<< "$cf_ips_v6"
+
+    if [[ ${#all_ips[@]} -eq 0 ]]; then
+        log_error "No Cloudflare IPs found. Firewall will block web traffic."
+        # Still enable firewall, but without web rules
+    else
+        log_info "Adding ${#all_ips[@]} Cloudflare IP rules to firewall..."
+        for ip in "${all_ips[@]}"; do
+            ufw allow from "$ip" to any port 80,443 proto tcp comment "Cloudflare" >/dev/null 2>&1
+        done
+        log_success "Firewall rules for Cloudflare IPs applied"
+    fi
+    
+    # Enable UFW
+    ufw --force enable >/dev/null 2>&1
+    log_success "Firewall is now active and configured"
+    return 0
+}
+
+# --- Caddy Config Update Function ---
+update_caddy_config() {
+    local cf_ips_v4="$1"
+    local cf_ips_v6="$2"
+    
     local temp_file="caddy/cloudflare-ips.caddy.new"
     local final_file="caddy/cloudflare-ips.caddy"
     local backup_file="caddy/cloudflare-ips.caddy.backup" # Backup file path
-
-    # Fetch IP ranges with timeout
-    log_info "Fetching IPv4 ranges..."
-    if ! cf_ips_v4=$(curl -sL --fail --max-time 30 https://www.cloudflare.com/ips-v4); then
-        log_error "Failed to fetch Cloudflare IPv4 ranges using curl."
-        return 1
-    fi
-
-    log_info "Fetching IPv6 ranges..."
-    if ! cf_ips_v6=$(curl -sL --fail --max-time 30 https://www.cloudflare.com/ips-v6); then
-        log_error "Failed to fetch Cloudflare IPv6 ranges using curl."
-        return 1
-    fi
-
-    # Validate IP ranges (basic check: ensure we got multiple lines/ranges)
-    if [[ $(echo "$cf_ips_v4" | wc -l) -lt 5 || $(echo "$cf_ips_v6" | wc -l) -lt 3 ]]; then
-        log_error "Cloudflare IP ranges appear invalid (too few ranges fetched)."
-        log_debug "IPv4 lines: $(echo "$cf_ips_v4" | wc -l), IPv6 lines: $(echo "$cf_ips_v6" | wc -l)"
-        return 1
-    fi
-    log_info "IP ranges fetched and basic validation passed."
 
     # Create new config file content
     local file_content
@@ -64,43 +100,53 @@ EOF
         return 1
     fi
 
-    # --- START Enhancement: Backup previous file ---
+    # Backup previous file
     if [[ -f "$final_file" ]]; then
-        log_info "Backing up existing IP list to $backup_file"
         cp "$final_file" "$backup_file" || log_warn "Could not backup previous config file $final_file"
     fi
-    # --- END Enhancement ---
 
-    # Atomic replacement: Set ownership/permissions then move
+    # Set permissions/ownership based on existing file/backup
     if [[ -f "$backup_file" ]]; then
-        # If backup exists, use it as reference for perms/ownership
-        chown --reference="$backup_file" "$temp_file" || log_warn "Could not set ownership on $temp_file"
-        chmod --reference="$backup_file" "$temp_file" || log_warn "Could not set permissions on $temp_file"
+        chown --reference="$backup_file" "$temp_file" 2>/dev/null || true
+        chmod --reference="$backup_file" "$temp_file" 2>/dev/null || true
     elif [[ -f "$final_file" ]]; then
-         # Fallback to using original file if backup failed
-        chown --reference="$final_file" "$temp_file" || log_warn "Could not set ownership on $temp_file"
-        chmod --reference="$final_file" "$temp_file" || log_warn "Could not set permissions on $temp_file"
+        chown --reference="$final_file" "$temp_file" 2>/dev/null || true
+        chmod --reference="$final_file" "$temp_file" 2>/dev/null || true
     else
-        # Fallback permissions if original doesn't exist
-        chmod 644 "$temp_file" || log_warn "Could not set permissions on $temp_file"
+        chmod 644 "$temp_file" 2>/dev/null || true
     fi
 
+    # Atomic move
     if ! mv "$temp_file" "$final_file"; then
         log_error "Failed to move temporary file to final location: $final_file"
         rm -f "$temp_file" # Clean up temp file on failure
         return 1
     fi
-    log_success "Successfully updated $final_file"
+    
+    log_success "Successfully updated Caddy config: $final_file"
+    return 0
+}
 
-    # Reload Caddy using docker compose exec
+# --- Caddy Reload Function ---
+reload_caddy() {
     log_info "Reloading Caddy configuration..."
+    
+    if ! is_service_running "caddy"; then
+        log_warn "Caddy service is not running. Skipping reload."
+        return 0
+    fi
+    
     if docker compose exec caddy caddy reload --config /etc/caddy/Caddyfile > /dev/null; then
-        log_success "Cloudflare IPs updated and Caddy reloaded successfully."
+        log_success "Caddy reloaded successfully."
         return 0
     else
         log_error "Failed to reload Caddy after IP update. Caddy might be using old IPs."
-        # --- START Enhancement: Restore backup on reload failure ---
+        
+        # Restore backup on reload failure
+        local final_file="caddy/cloudflare-ips.caddy"
+        local backup_file="caddy/cloudflare-ips.caddy.backup"
         log_warn "Attempting to restore previous IP list from backup..."
+        
         if [[ -f "$backup_file" ]]; then
             if mv "$backup_file" "$final_file"; then
                 log_info "Successfully restored previous IP list. Reloading Caddy again..."
@@ -115,13 +161,14 @@ EOF
         else
             log_error "No backup file found to restore. Manual intervention required."
         fi
-        # --- END Enhancement ---
         return 1
     fi
 }
 
 # --- Main Execution ---
 main() {
+    log_info "Updating Cloudflare IP ranges for Firewall and Caddy..."
+
     # Load environment needed for docker compose
     load_env_file || {
         log_error "Failed to load .env file. Cannot run docker compose."
@@ -131,20 +178,59 @@ main() {
     # Ensure Docker is available
     require_docker || exit 1
 
-    if ! update_cloudflare_ips; then
-        log_error "Cloudflare IP update process failed."
-        # Send email notification ONLY on failure
-        send_notification_email "Cloudflare IP Update Failed" \
-            "The automated process to update Cloudflare IP ranges failed on $(hostname -f 2>/dev/null || hostname). Caddy may not trust incoming connections correctly. Please check logs ($PROJECT_ROOT/logs/cron.log or similar) or run the script manually."
-        exit 1
+    local cf_ips_v4 cf_ips_v6
+
+    # Fetch IP ranges
+    log_info "Fetching IPv4 ranges..."
+    if ! cf_ips_v4=$(curl -sL --fail --max-time 30 https://www.cloudflare.com/ips-v4); then
+        log_error "Failed to fetch Cloudflare IPv4 ranges using curl."
+        return 1
     fi
 
-    log_info "Cloudflare IP update completed successfully."
-    exit 0
+    log_info "Fetching IPv6 ranges..."
+    if ! cf_ips_v6=$(curl -sL --fail --max-time 30 https://www.cloudflare.com/ips-v6); then
+        log_error "Failed to fetch Cloudflare IPv6 ranges using curl."
+        return 1
+    fi
+
+    # Validate IP ranges
+    if [[ $(echo "$cf_ips_v4" | wc -l) -lt 5 || $(echo "$cf_ips_v6" | wc -l) -lt 3 ]]; then
+        log_error "Cloudflare IP ranges appear invalid (too few ranges fetched)."
+        return 1
+    fi
+    log_info "IP ranges fetched and basic validation passed."
+
+    # Update Firewall
+    # Must be run as root. The cron job does this.
+    if ! update_firewall_rules "$cf_ips_v4" "$cf_ips_v6"; then
+        log_error "Firewall update failed. Aborting."
+        return 1
+    fi
+    
+    # Update Caddy Config
+    if ! update_caddy_config "$cf_ips_v4" "$cf_ips_v6"; then
+        log_error "Caddy config update failed. Aborting."
+        return 1
+    fi
+    
+    # Reload Caddy
+    if ! reload_caddy; then
+        log_error "Caddy reload failed."
+        return 1
+    fi
+
+    log_success "Cloudflare IPs updated, firewall configured, and Caddy reloaded."
+    return 0
 }
 
-# Ensure script is not sourced
-if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-    main "$@"
+# --- Main Entry Point ---
+# Handle errors and send email notifications ONLY on failure
+if ! main "$@"; then
+    log_error "Cloudflare IP update process failed."
+    # Send email notification ONLY on failure
+    send_notification_email "Cloudflare IP Update Failed" \
+        "The automated process to update Cloudflare IP ranges and firewall rules failed on $(hostname -f 2>/dev/null || hostname). Caddy may not trust connections or the firewall may be misconfigured. Please check logs ($PROJECT_ROOT/logs/cron.log or similar) or run the script manually."
+    exit 1
 fi
 
+exit 0
