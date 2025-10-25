@@ -3,7 +3,8 @@
 # Uses centralized library functions
 
 set -euo pipefail
-trap "rm -rf '$PROJECT_ROOT/secrets/.docker_secrets' '$PROJECT_ROOT/.env.secrets' 2>/dev/null" EXIT HUP INT TERM
+# --- P4.2 CHANGE: Removed .env.secrets from trap ---
+trap "rm -rf '$PROJECT_ROOT/secrets/.docker_secrets' 2>/dev/null" EXIT HUP INT TERM
 
 # --- Project Root Resolution ---
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -81,8 +82,8 @@ prepare_docker_secrets() {
     fi
 
     # Get all secrets and create individual files
-    # --- FIX: Add admin_basic_auth_hash to ensure file is created for docker-compose ---
-    local secrets=("admin_token" "smtp_password" "push_installation_id" "push_installation_key" "cloudflare_api_token" "admin_basic_auth_hash")
+    # --- P1.2 CHANGE: Updated secrets list ---
+    local secrets=("admin_token" "smtp_password" "push_installation_id" "push_installation_key" "admin_basic_auth_hash" "ddclient_api_token" "fail2ban_api_token")
 
     for secret in "${secrets[@]}"; do
         local value
@@ -116,27 +117,29 @@ prepare_environment_variables() {
         export ADMIN_BASIC_AUTH_HASH="CHANGE_ME_BCRYPT_HASH"
     fi
 
-    # Get Cloudflare API token if configured
-    local cloudflare_token
-    if cloudflare_token=$(get_secret "cloudflare_api_token" 2>/dev/null) && [[ -n "$cloudflare_token" ]] && [[ "$cloudflare_token" != "CHANGE_ME"* ]] && [[ "$cloudflare_token" != "" ]]; then
-        export CLOUDFLARE_API_TOKEN="$cloudflare_token"
-        log_success "Cloudflare API token loaded"
+    # --- P1.2 CHANGE: Export new split tokens ---
+    # Get DDClient API token if configured
+    local ddclient_token
+    if ddclient_token=$(get_secret "ddclient_api_token" 2>/dev/null) && [[ -n "$ddclient_token" ]] && [[ "$ddclient_token" != "CHANGE_ME"* ]] && [[ "$ddclient_token" != "" ]]; then
+        export DDCLIENT_API_TOKEN="$ddclient_token"
+        log_success "DDClient API token loaded"
     else
-        export CLOUDFLARE_API_TOKEN=""
-        log_info "Cloudflare API token not configured (optional)"
+        export DDCLIENT_API_TOKEN=""
+        log_info "DDClient API token not configured (optional)"
     fi
 
-    # Write to .env.secrets for docker-compose if needed
-    # Note: This file isn't strictly necessary as variables are exported, but kept for clarity/debugging
-    cat > .env.secrets << EOF
-# Generated environment variables from secrets
-# This file is created automatically by startup.sh
-ADMIN_BASIC_AUTH_HASH=$ADMIN_BASIC_AUTH_HASH
-CLOUDFLARE_API_TOKEN=$CLOUDFLARE_API_TOKEN
-EOF
-
-    secure_file .env.secrets 600
-    log_success "Environment variables prepared"
+    # Get Fail2Ban/Caddy API token if configured
+    local fail2ban_token
+    if fail2ban_token=$(get_secret "fail2ban_api_token" 2>/dev/null) && [[ -n "$fail2ban_token" ]] && [[ "$fail2ban_token" != "CHANGE_ME"* ]] && [[ "$fail2ban_token" != "" ]]; then
+        export FAIL2BAN_API_TOKEN="$fail2ban_token"
+        log_success "Fail2Ban/Caddy API token loaded"
+    else
+        export FAIL2BAN_API_TOKEN=""
+        log_info "Fail2Ban/Caddy API token not configured (optional)"
+    fi
+    
+    # --- P4.2 CHANGE: Removed .env.secrets file creation ---
+    log_success "Secrets exported to environment"
     return 0
 }
 
@@ -217,7 +220,8 @@ main() {
         else
             stop_services
             # Clean up temporary files
-            rm -rf secrets/.docker_secrets .env.secrets 2>/dev/null || true
+            # --- P4.2 CHANGE: Removed .env.secrets ---
+            rm -rf secrets/.docker_secrets 2>/dev/null || true
             log_success "Services stopped successfully"
         fi
         return 0
