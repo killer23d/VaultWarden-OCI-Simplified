@@ -17,14 +17,13 @@ source "lib/crypto.sh"
 
 # --- Configuration ---
 BACKUP_TYPE="db"  # db, full, or emergency
-# --- START P1: Add Rclone/Email flags ---
 EMAIL_NOTIFY=false
 RCLONE_SYNC=false
-# --- END P1 ---
-RETENTION_DAYS=30
+# --- P12 FIX: Removed RETENTION_DAYS variable ---
 
 # --- Help ---
 show_help() {
+    # --- P12 FIX: Removed --retention option ---
     cat << 'EOF'
 VaultWarden-OCI-NG Backup Tool
 
@@ -35,7 +34,6 @@ OPTIONS:
     --type TYPE      Backup type: db, full, or emergency (default: db)
     --rclone         Sync backups directory to rclone remote after creation
     --email          Send email notification on completion
-    --retention N    Keep backups for N days (default: 30)
     --help           Show this help
 
 BACKUP TYPES:
@@ -45,7 +43,7 @@ BACKUP TYPES:
 
 EXAMPLES:
     ./backup.sh                    # Quick database backup
-    ./backup.sh --type full        # Full system backup  
+    ./backup.sh --type full        # Full system backup
     ./backup.sh --type emergency   # Create emergency kit
     ./backup.sh --rclone --email   # Backup, sync to cloud, and send email
 EOF
@@ -55,11 +53,9 @@ EOF
 while [[ $# -gt 0 ]]; do
     case $1 in
         --type) BACKUP_TYPE="$2"; shift 2 ;;
-        # --- START P1: Parse new flags ---
         --email) EMAIL_NOTIFY=true; shift ;;
         --rclone) RCLONE_SYNC=true; shift ;;
-        # --- END P1 ---
-        --retention) RETENTION_DAYS="$2"; shift 2 ;;
+        # --- P12 FIX: Removed --retention parsing ---
         --help) show_help; exit 0 ;;
         *) log_error "Unknown option: $1"; show_help; exit 1 ;;
     esac
@@ -89,7 +85,7 @@ create_db_backup() {
         log_info "Verifying database backup integrity..."
         local integrity_check
         integrity_check=$(exec_in_service vaultwarden sqlite3 /tmp/backup.db "PRAGMA integrity_check;" 2>/dev/null)
-        
+
         if [[ "$integrity_check" != "ok" ]]; then
             log_error "Database integrity check failed: $integrity_check"
             exec_in_service vaultwarden rm -f /tmp/backup.db 2>/dev/null || true
@@ -132,7 +128,7 @@ create_db_backup() {
 
     # Remove unencrypted file
     rm -f "$backup_dir/$backup_file"
-    secure_file "$backup_dir/$encrypted_file" 600
+    secure_file "$backup_dir/$encrypted_file" 600 || { log_error "Failed to secure backup file permissions"; return 1; } # P16 FIX
 
     log_success "Database backup created: $encrypted_file"
     echo "$backup_dir/$encrypted_file"
@@ -176,7 +172,7 @@ create_full_backup() {
             log_error "Failed to create database snapshot inside container"
             return 1
         fi
-        
+
         log_info "Verifying database snapshot integrity..."
         local integrity_check
         integrity_check=$(exec_in_service vaultwarden sqlite3 /tmp/backup.db "PRAGMA integrity_check;" 2>/dev/null)
@@ -186,7 +182,7 @@ create_full_backup() {
             return 1
         fi
         log_success "Database snapshot integrity verified"
-        
+
         if ! docker compose exec vaultwarden cat /tmp/backup.db > "$db_snapshot"; then
             log_error "Failed to copy database snapshot from container"
             return 1
@@ -205,7 +201,7 @@ create_full_backup() {
     if [[ -d "$state_dir/data" ]]; then
         log_info "Copying all data files..."
         cp -r "$state_dir/data" "$temp_dir/data"
-        
+
         if [[ -f "$db_snapshot" ]]; then
             mkdir -p "$temp_dir/data/bwdata"
             mv "$db_snapshot" "$temp_dir/data/bwdata/db.sqlite3"
@@ -242,7 +238,7 @@ EOF
 
     # Remove unencrypted file
     rm -f "$backup_dir/$backup_file"
-    secure_file "$backup_dir/$encrypted_file" 600
+    secure_file "$backup_dir/$encrypted_file" 600 || { log_error "Failed to secure backup file permissions"; return 1; } # P16 FIX
 
     log_success "Full backup created: $encrypted_file"
     echo "$backup_dir/$encrypted_file"
@@ -288,24 +284,26 @@ create_emergency_kit() {
 
 ## Quick Recovery Steps
 1. Set up new Ubuntu 24.04 server
-2. Extract this kit: `age -d -i age-key.txt emergency-kit.tar.gz.age | tar -xzf -`
-3. Install Docker: `sudo apt update && sudo apt install -y docker.io docker-compose-plugin`
-4. Restore files to project directory
-5. Start services: `docker compose up -d`
+2. Extract this kit: `age -d -i secrets/keys/age-key.txt emergency-kit-*.tar.gz.age | tar -xzf - -C /path/to/restore`
+3. Install dependencies: `sudo apt update && sudo apt install -y docker.io docker-compose-plugin age sops nano`
+4. Copy extracted files to project directory (e.g., `/opt/vaultwarden`)
+5. Set ownership: `sudo chown -R your_user:your_group /opt/vaultwarden`
+6. Set permissions: `chmod 600 /opt/vaultwarden/.env /opt/vaultwarden/secrets/secrets.yaml /opt/vaultwarden/secrets/keys/age-key.txt`
+7. Start services: `cd /opt/vaultwarden && ./startup.sh`
 
 ## Files Included
 - docker-compose.yml - Container configuration
-- .env - Environment variables  
+- .env - Environment variables
 - caddy/ - Reverse proxy configuration
 - fail2ban/ - Security configuration
 - secrets/ - Encrypted secrets (including Age keys)
 - data/ - VaultWarden database and files
 
 ## Important Notes
-- Keep Age private key (secrets/keys/age-key.txt) secure and backed up separately
-- Update DNS to point domain to new server IP
-- Verify firewall allows ports 80 and 443
-- Check service health after startup: `docker compose ps`
+- Keep Age private key (secrets/keys/age-key.txt) secure and backed up separately!
+- Update DNS to point domain to new server IP.
+- Verify firewall allows SSH port (defined in .env) and ports 80/443 from Cloudflare IPs.
+- Check service health after startup: `./health.sh`
 
 Recovery Time: ~15-30 minutes with proper preparation
 EOF
@@ -317,7 +315,7 @@ EOF
 
     cat > "$temp_dir/kit-info.txt" << EOF
 Emergency Kit Created: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
-Source Host: $(hostname -f 2>/dev/null || hostname)  
+Source Host: $(hostname -f 2>/dev/null || hostname)
 Domain: $domain
 Kit Version: Simplified v1.0
 EOF
@@ -338,7 +336,7 @@ EOF
 
     # Remove unencrypted file
     rm -f "$backup_dir/$kit_file"
-    secure_file "$backup_dir/$encrypted_file" 600
+    secure_file "$backup_dir/$encrypted_file" 600 || { log_error "Failed to secure kit file permissions"; return 1; } # P16 FIX
 
     log_success "Emergency kit created: $encrypted_file"
     log_warn "IMPORTANT: Store this kit and Age key separately and securely!"
@@ -346,28 +344,27 @@ EOF
     return 0
 }
 
-# --- START P1: Rclone Offsite Sync ---
 rclone_sync_offsite() {
     local backup_file_path="$1"
-    
+
     log_info "Starting offsite backup sync..."
-    
+
     if ! has_command rclone; then
         log_error "rclone command not found. Cannot sync offsite."
         log_info "Install with: sudo apt install rclone"
         return 1
     fi
-    
+
     local remote_name
     remote_name=$(get_config_value "RCLONE_REMOTE_NAME" "")
-    
-    if [[ -z "$remote_name" ]]; then
-        log_warn "RCLONE_REMOTE_NAME not set in .env. Skipping offsite sync."
+
+    if [[ -z "$remote_name" ]] || [[ "$remote_name" == "CHANGE_ME" ]]; then
+        log_warn "RCLONE_REMOTE_NAME not configured in .env. Skipping offsite sync."
         return 1
     fi
-    
+
     local remote_path="$remote_name:vaultwarden_backups"
-    
+
     # --- P6 FIX: Copy only the specific encrypted file ---
     local backup_filename
     backup_filename=$(basename "$backup_file_path")
@@ -376,31 +373,29 @@ rclone_sync_offsite() {
     local remote_file_path="$remote_path/$backup_type_dir/$backup_filename"
 
     log_info "Syncing '$backup_filename' to remote: $remote_file_path"
-    
+
     # We sync the single file, not the whole directory, to prevent race conditions
     if ! rclone copyto "$backup_file_path" "$remote_file_path"; then
     # --- END P6 FIX ---
         log_error "Rclone sync failed"
         return 1
     fi
-    
+
     log_success "Rclone sync completed"
-    
-    # --- Start User Suggestion: Backup Size Validation ---
+
     log_info "Verifying remote backup file..."
-    
+
     local local_size
     local_size=$(du -b "$backup_file_path" | cut -f1)
-    
+
     local remote_size_json
-    # remote_file_path is already defined above for the P6 fix
     remote_size_json=$(rclone size "$remote_file_path" --json 2>/dev/null)
-    
+
     if [[ -z "$remote_size_json" ]]; then
         log_warn "Could not get remote file size for verification."
         return 0 # Don't fail the job, just warn
     fi
-    
+
     local remote_size
     remote_size=$(echo "$remote_size_json" | jq -r '.bytes // 0')
 
@@ -410,34 +405,11 @@ rclone_sync_offsite() {
         log_warn "Cloud backup size mismatch! Local: $local_size, Remote: $remote_size"
         log_warn "This could indicate a corrupted upload. Please check remote."
     fi
-    # --- End User Suggestion ---
-    
+
     return 0
 }
-# --- END P1 ---
 
-# --- Cleanup Function ---
-cleanup_old_backups() {
-    log_info "Cleaning up old backups (retention: ${RETENTION_DAYS} days)..."
-
-    local backup_base="$PROJECT_ROOT/backups"
-    local cleaned=0
-
-    if [[ -d "$backup_base" ]]; then
-        # Find and remove old encrypted backup files
-        while IFS= read -r -d '' old_file; do
-            log_info "Removing old backup: $(basename "$old_file")"
-            rm -f "$old_file"
-            ((cleaned++))
-        done < <(find "$backup_base" -name "*.age" -mtime +${RETENTION_DAYS} -print0 2>/dev/null)
-
-        if [[ "$cleaned" -gt 0 ]]; then
-            log_success "Cleaned up $cleaned old backup(s)"
-        else
-            log_info "No old backups to clean up"
-        fi
-    fi
-}
+# --- P12 FIX: Removed cleanup_old_backups function ---
 
 # --- Main Execution ---
 main() {
@@ -451,7 +423,6 @@ main() {
 
     # Check required commands
     require_commands tar gzip age || exit 1
-    # --- P1: Check rclone if flag is set ---
     if [[ "$RCLONE_SYNC" == "true" ]]; then
         require_commands rclone || exit 1
     fi
@@ -485,11 +456,10 @@ main() {
             exit 1
             ;;
     esac
-    
+
     local file_size
     file_size=$(du -h "$backup_file" | cut -f1)
 
-    # --- START P1: Handle Rclone Sync ---
     local sync_status="Skipped"
     if [[ "$RCLONE_SYNC" == "true" ]]; then
         if rclone_sync_offsite "$backup_file"; then
@@ -498,28 +468,25 @@ main() {
             sync_status="Failed"
         fi
     fi
-    # --- END P1 ---
 
-    # Cleanup old backups
-    cleanup_old_backups
+    # --- P12 FIX: Removed call to cleanup_old_backups ---
 
     log_success "Backup completed successfully!"
     echo ""
     echo "Backup Details:"
     echo "  Type: $BACKUP_TYPE"
-    echo "  File: $backup_file"  
+    echo "  File: $backup_file"
     echo "  Size: $file_size"
     echo "  Rclone Sync: $sync_status"
     echo ""
     echo "To restore:"
-    echo "  age -d -i secrets/keys/age-key.txt '$backup_file' | tar -xzf -"
-    
-    # --- START P1: Handle Email Notification ---
+    echo "  ./restore.sh '$backup_file'" # Updated restore command example
+
     if [[ "$EMAIL_NOTIFY" == "true" ]]; then
         log_info "Sending completion email..."
         local email_subject="Backup Completed: $BACKUP_TYPE"
         local email_body="VaultWarden backup job completed.
-        
+
 Type: $BACKUP_TYPE
 File: $(basename "$backup_file")
 Size: $file_size
@@ -527,7 +494,7 @@ Rclone Sync: $sync_status
 "
         send_notification_email "$email_subject" "$email_body"
     fi
-    # --- END P1 ---
 }
 
 main "$@"
+
