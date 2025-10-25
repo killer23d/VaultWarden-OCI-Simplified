@@ -162,7 +162,6 @@ services:
       - ./fail2ban/filter.d:/config/filter.d:ro
       - ./fail2ban/action.d:/config/action.d:ro
       - ${PROJECT_STATE_DIR:-/var/lib/vaultwarden}/logs/caddy:/var/log/caddy:ro
-      # --- FIX: Removed unused Vaultwarden log mount ---
       - ${PROJECT_STATE_DIR:-/var/lib/vaultwarden}/logs/fail2ban:/var/log:rw
 
     healthcheck:
@@ -194,7 +193,6 @@ services:
     image: ddclient/ddclient:${DDCLIENT_VERSION:-3.11.2}
     container_name: vaultwarden_ddclient
     restart: unless-stopped
-    # --- P5 CHANGE: Use UID/GID from .env file ---
     user: "${UID:-1000}:${GID:-1000}"
 
     volumes:
@@ -262,3 +260,4 @@ networks:
     ipam:
       config:
         - subnet: 172.20.0.0/16
+
