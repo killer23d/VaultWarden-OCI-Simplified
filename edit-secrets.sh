@@ -126,9 +126,12 @@ backup_passphrase: $backup_pass
 push_installation_id: CHANGE_ME_OR_LEAVE_EMPTY
 push_installation_key: CHANGE_ME_OR_LEAVE_EMPTY
 
-# Optional: Cloudflare API token (for DNS challenges and Fail2Ban)
-# Create a scoped token: Zone:Zone:Read, Zone:DNS:Edit, Zone:Firewall Services:Edit
-cloudflare_api_token: CHANGE_ME_CLOUDFLARE_API_TOKEN
+# --- P1 CHANGE: Split Cloudflare token ---
+# Cloudflare API token for DDNS (Permissions: Zone:DNS:Edit)
+ddclient_api_token: CHANGE_ME_DDCLIENT_API_TOKEN
+
+# Cloudflare API token for Fail2Ban/Caddy (Permissions: Zone:Firewall Services:Edit)
+fail2ban_api_token: CHANGE_ME_FAIL2BAN_API_TOKEN
 EOF
 
     log_success "Template secrets file created"
@@ -146,9 +149,11 @@ EOF
     log_warn "IMPORTANT: Update the CHANGE_ME values:"
     log_info "  1. Run: ./edit-secrets.sh"
     log_info "  2. Update admin_basic_auth_hash"
-    log_info "  3. Update cloudflare_api_token"
-    log_info "  4. Update smtp_password if using email notifications"
-    log_info "  5. Update push_installation_id and push_installation_key if using push"
+    # --- P1 CHANGE: Updated help text ---
+    log_info "  3. Update ddclient_api_token (for dynamic DNS)"
+    log_info "  4. Update fail2ban_api_token (for firewall bans)"
+    log_info "  5. Update smtp_password if using email notifications"
+    log_info "  6. Update push_installation_id and push_installation_key if using push"
 
     return 0
 }
