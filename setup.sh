@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 # setup.sh - Complete VaultWarden-OCI-NG system setup with library integration
-# Corrected version addressing v4 review feedback
 
 set -euo pipefail
 
@@ -45,7 +44,7 @@ EXAMPLES:
 
 DESCRIPTION:
     Complete system setup including:
-    - System dependencies (Docker, Age, SOPS, Rclone, Mailutils, Nano)
+    - System dependencies (Docker, Age, SOPS, Rclone, Mailutils, Nano, Argon2)
     - Firewall configuration
     - Age encryption keys
     - Environment configuration
@@ -146,8 +145,8 @@ install_dependencies() {
     }
 
     # Required packages
-    # --- P15 FIX: Added nano ---
-    local packages=("docker.io" "docker-compose-plugin" "age" "sops" "ufw" "curl" "jq" "sqlite3" "gzip" "tar" "cron" "rclone" "mailutils" "nano")
+    # --- P5 FIX: Added argon2 ---
+    local packages=("docker.io" "docker-compose-plugin" "age" "sops" "ufw" "curl" "jq" "sqlite3" "gzip" "tar" "cron" "rclone" "mailutils" "nano" "argon2")
     local missing_packages=()
 
     # Check which packages are missing
@@ -713,4 +712,3 @@ main() {
 }
 
 main "$@"
-
