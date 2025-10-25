@@ -230,42 +230,6 @@ is_sops_encrypted() {
 
 # --- Secrets Management ---
 
-# Load secrets from SOPS file into environment
-load_secrets() {
-    local secrets_file="${1:-$DEFAULT_SECRETS_FILE}"
-
-    if [[ ! -f "$secrets_file" ]]; then
-        return 1
-    fi
-
-    if ! is_sops_encrypted "$secrets_file"; then
-        return 1
-    fi
-
-    if ! check_sops_available; then
-        return 1
-    fi
-
-    # Decrypt and source secrets
-    local decrypted_content
-    decrypted_content=$(sops_decrypt "$secrets_file") || return 1
-
-    # Parse YAML and export variables (simple key: value format)
-    while IFS=': ' read -r key value; do
-        # Skip comments and empty lines
-        [[ "$key" =~ ^[[:space:]]*# ]] && continue
-        [[ -z "$key" ]] && continue
-
-        # Remove quotes from value
-        value=$(echo "$value" | sed 's/^["''']*//;s/["''']*$//')
-
-        # Export variable
-        export "$key=$value"
-    done <<< "$decrypted_content"
-
-    return 0
-}
-
 # Get specific secret value
 get_secret() {
     local key="$1"
@@ -280,43 +244,9 @@ get_secret() {
     fi
 
     # Decrypt and extract specific key
+    # Note: This is the original fragile method, kept for prepare_environment_variables
+    # startup.sh (prepare_docker_secrets) should use the robust jq method
     sops_decrypt "$secrets_file" | grep "^${key}:" | cut -d':' -f2- | sed 's/^[[:space:]]*//;s/^["''']*//;s/["''']*$//'
-}
-
-# Set secret value (updates SOPS file)
-set_secret() {
-    local key="$1"
-    local value="$2"
-    local secrets_file="${3:-$DEFAULT_SECRETS_FILE}"
-
-    if [[ ! -f "$secrets_file" ]]; then
-        return 1
-    fi
-
-    if ! check_sops_available; then
-        return 1
-    fi
-
-    # Create temporary file
-    local temp_file
-    temp_file=$(mktemp) || return 1
-    trap "rm -f '$temp_file'" RETURN
-
-    # Decrypt to temp file
-    sops_decrypt "$secrets_file" > "$temp_file" || return 1
-
-    # Update or add key
-    if grep -q "^${key}:" "$temp_file"; then
-        # Update existing key
-        sed -i "s/^${key}:.*/${key}: $value/" "$temp_file"
-    else
-        # Add new key
-        echo "${key}: $value" >> "$temp_file"
-    fi
-
-    # Re-encrypt
-    cp "$temp_file" "$secrets_file"
-    sops_encrypt "$secrets_file"
 }
 
 # --- Utility Functions ---
@@ -345,19 +275,13 @@ generate_hex_string() {
     fi
 }
 
-# Validate Age key format
-validate_age_key() {
-    local key_content="$1"
-
-    # Basic Age key format check
-    [[ "$key_content" =~ ^AGE-SECRET-KEY-1[A-Z0-9]{58}$ ]]
-}
+# --- FIX #7: Removed dead code: load_secrets, set_secret, validate_age_key ---
 
 # Export functions for use by scripts
 export -f check_age_key generate_age_keypair get_public_key
 export -f encrypt_file decrypt_file encrypt_data decrypt_data
 export -f check_sops_available sops_encrypt sops_decrypt sops_edit is_sops_encrypted
-export -f load_secrets get_secret set_secret
-export -f generate_secure_string generate_hex_string validate_age_key
+export -f get_secret
+export -f generate_secure_string generate_hex_string
 
 log_debug "Crypto library loaded successfully" 2>/dev/null || true
