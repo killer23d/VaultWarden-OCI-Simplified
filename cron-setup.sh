@@ -133,24 +133,25 @@ install_vaultwarden_crons() {
 
     # Define cron jobs
     local cron_jobs
+    # --- FIX: Redirect all cron output to logs/cron.log to catch silent failures ---
     read -r -d '' cron_jobs << EOF || true
 # VaultWarden-OCI-NG Automated Tasks
 # Generated on $(date)
 
 # Daily database backup at 2:00 AM, with rclone sync and email
-0 2 * * * $real_user cd $PROJECT_ROOT && ./backup.sh --type db --rclone --email >/dev/null 2>&1
+0 2 * * * $real_user cd $PROJECT_ROOT && ./backup.sh --type db --rclone --email >> $PROJECT_ROOT/logs/cron.log 2>&1
 
 # Weekly full backup on Sunday at 1:00 AM, with rclone sync and email
-0 1 * * 0 $real_user cd $PROJECT_ROOT && ./backup.sh --type full --rclone --email >/dev/null 2>&1
+0 1 * * 0 $real_user cd $PROJECT_ROOT && ./backup.sh --type full --rclone --email >> $PROJECT_ROOT/logs/cron.log 2>&1
 
 # Health check every 6 hours with auto-heal and email on failure
-0 */6 * * * $real_user cd $PROJECT_ROOT && ./health.sh --auto-heal --quiet --email-alert >/dev/null 2>&1
+0 */6 * * * $real_user cd $PROJECT_ROOT && ./health.sh --auto-heal --quiet --email-alert >> $PROJECT_ROOT/logs/cron.log 2>&1
 
 # Weekly container updates on Sunday at 3:00 AM (sends email)
-0 3 * * 0 $real_user cd $PROJECT_ROOT && ./update.sh --type containers --force >/dev/null 2>&1
+0 3 * * 0 $real_user cd $PROJECT_ROOT && ./update.sh --type containers --force >> $PROJECT_ROOT/logs/cron.log 2>&1
 
 # Monthly system updates on first Sunday at 4:00 AM (sends email, auto-reboots)
-0 4 1-7 * 0 root cd $PROJECT_ROOT && ./update.sh --type system --force >/dev/null 2>&1
+0 4 1-7 * 0 root cd $PROJECT_ROOT && ./update.sh --type system --force >> $PROJECT_ROOT/logs/cron.log 2>&1
 
 # --- FIX: Use dedicated script for Cloudflare IP update ---
 # Weekly Cloudflare IP update on Monday at 5:00 AM (runs as root, sends email on failure)
@@ -417,4 +418,3 @@ main() {
 }
 
 main "$@"
-
