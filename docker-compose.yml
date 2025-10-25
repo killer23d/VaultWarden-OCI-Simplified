@@ -86,6 +86,7 @@ services:
     image: caddy:${CADDY_VERSION:-2.8.4}
     container_name: vaultwarden_caddy
     restart: unless-stopped
+    # --- P5 CHANGE: Use UID/GID from .env file ---
     user: "${UID:-1000}:${GID:-1000}"
 
     environment:
@@ -119,7 +120,7 @@ services:
       interval: 60s
       timeout: 15s
       retries: 5
-      start_period: 60s
+      start_period: 30s # Consider increasing this to 60s or 90s (Issue #3)
 
     logging:
       driver: "json-file"
@@ -161,7 +162,7 @@ services:
       - ./fail2ban/filter.d:/config/filter.d:ro
       - ./fail2ban/action.d:/config/action.d:ro
       - ${PROJECT_STATE_DIR:-/var/lib/vaultwarden}/logs/caddy:/var/log/caddy:ro
-      - ${PROJECT_STATE_DIR:-/var/lib/vaultwarden}/logs/vaultwarden:/var/log/vaultwarden:ro
+      # --- FIX: Removed unused Vaultwarden log mount ---
       - ${PROJECT_STATE_DIR:-/var/lib/vaultwarden}/logs/fail2ban:/var/log:rw
 
     healthcheck:
@@ -261,4 +262,3 @@ networks:
     ipam:
       config:
         - subnet: 172.20.0.0/16
-
