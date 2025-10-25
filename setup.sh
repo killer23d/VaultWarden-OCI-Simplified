@@ -229,17 +229,16 @@ configure_firewall() {
     ufw allow "$ssh_port/tcp" comment "SSH" >/dev/null 2>&1
     log_success "SSH access allowed on port $ssh_port"
 
-    # Allow HTTP and HTTPS
-    ufw allow 80/tcp comment "HTTP" >/dev/null 2>&1
-    ufw allow 443/tcp comment "HTTPS" >/dev/null 2>&1
-    log_success "Web traffic allowed (ports 80, 443)"
+    # --- FIX: Web rules are now handled by update-cloudflare-ips.sh ---
+    # We will call that script later in main() to populate web rules.
+    # This function now ONLY handles the basics.
 
     # Enable UFW
     ufw --force enable >/dev/null 2>&1
-    log_success "Firewall configured and enabled"
+    log_success "Firewall configured and enabled with SSH access"
 
     # Show status
-    log_info "Firewall status:"
+    log_info "Firewall status (web rules will be added next):"
     ufw status numbered | head -20
 
     return 0
@@ -278,6 +277,9 @@ setup_directories() {
     ensure_dir "$PROJECT_ROOT/backups/db" 755 "$real_user:$real_user"
     ensure_dir "$PROJECT_ROOT/backups/full" 755 "$real_user:$real_user"
     ensure_dir "$PROJECT_ROOT/backups/emergency" 755 "$real_user:$real_user"
+
+    # --- FIX: Ensure logs directory exists for cron output ---
+    ensure_dir "$PROJECT_ROOT/logs" 755 "$real_user:$real_user"
 
     log_success "Directory structure created with appropriate permissions"
     return 0
@@ -566,7 +568,7 @@ setup_script_permissions() {
     log_info "Setting up script permissions..."
 
     local scripts=("startup.sh" "health.sh" "backup.sh" "restore.sh" "edit-secrets.sh" 
-                   "update.sh" "maintenance.sh" "cron-setup.sh")
+                   "update.sh" "maintenance.sh" "cron-setup.sh" "update-cloudflare-ips.sh")
     local real_user
     real_user=$(get_real_user)
 
@@ -677,6 +679,16 @@ main() {
     setup_initial_secrets || exit 1
     validate_docker_setup || exit 1
     setup_script_permissions || exit 1
+    
+    # --- FIX: Run Cloudflare IP update script to populate web firewall rules ---
+    log_info "Populating firewall rules for Cloudflare..."
+    if ./update-cloudflare-ips.sh; then
+        log_success "Firewall rules for Cloudflare IPs applied"
+    else
+        log_error "Failed to apply Cloudflare IP firewall rules"
+        log_warn "Your firewall may be blocking web traffic. Run './update-cloudflare-ips.sh' manually."
+    fi
+    # --- END FIX ---
 
     echo ""
     log_info "Running final validation..."
