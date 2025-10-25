@@ -7,7 +7,8 @@ services:
     image: vaultwarden/server:${VAULTWARDEN_VERSION:-1.30.5}
     container_name: vaultwarden_app
     restart: unless-stopped
-    user: "1000:1000"
+    # --- P5 FIX: Use PUID/PGID from .env file ---
+    user: "${PUID:-1000}:${PGID:-1000}"
 
     environment:
       - DOMAIN=https://${DOMAIN}
@@ -87,13 +88,14 @@ services:
     image: caddy:${CADDY_VERSION:-2.8.4}
     container_name: vaultwarden_caddy
     restart: unless-stopped
-    user: "1000:1000"
+    # --- P5 FIX: Use PUID/PGID from .env file ---
+    user: "${PUID:-1000}:${PGID:-1000}"
 
     environment:
       - DOMAIN=${DOMAIN}
       - EMAIL=${ADMIN_EMAIL}
       - ADMIN_BASIC_AUTH_HASH=${ADMIN_BASIC_AUTH_HASH}
-      # --- P1.3 CHANGE: Use new token for Caddy DNS challenge (if used) ---
+      # --- P1 CHANGE: Use new token for Caddy DNS challenge (if used) ---
       - CLOUDFLARE_API_TOKEN_FILE=/run/secrets/fail2ban_api_token
 
     ports:
@@ -108,7 +110,7 @@ services:
       - ${PROJECT_STATE_DIR:-/var/lib/vaultwarden}/logs/caddy:/logs:rw
 
     secrets:
-      # --- P1.3 CHANGE: Use new token ---
+      # --- P1 CHANGE: Use new token ---
       - fail2ban_api_token
       - admin_basic_auth_hash
 
@@ -145,6 +147,7 @@ services:
     image: crazymax/fail2ban:${FAIL2BAN_VERSION:-1.1.0}
     container_name: vaultwarden_fail2ban
     restart: unless-stopped
+    # Runs as root by default, which is correct for fail2ban
 
     environment:
       - TZ=UTC
@@ -153,7 +156,7 @@ services:
       - F2B_DB_PURGE_AGE=1d
       - F2B_MAX_RETRY=3
       - F2B_DEST_EMAIL=${ADMIN_EMAIL}
-      # --- P1.3 CHANGE: Use new token variable ---
+      # --- P1 CHANGE: Use new token variable ---
       - CLOUDFLARE_API_TOKEN=${FAIL2BAN_API_TOKEN:-} # Read by gomplate in jail.d
       - CLOUDFLARE_ZONE_ID=${CLOUDFLARE_ZONE_ID:-}     # Read by gomplate in jail.d
 
@@ -187,7 +190,7 @@ services:
           memory: 32m
           cpus: '0.02'
 
-    # --- P4.1 CHANGE: Removed network_mode: host ---
+    # --- P4 CHANGE: Removed network_mode: host (from previous step) ---
     networks:
       - vaultwarden_network
 
@@ -195,7 +198,8 @@ services:
     image: ddclient/ddclient:${DDCLIENT_VERSION:-3.11.2}
     container_name: vaultwarden_ddclient
     restart: unless-stopped
-    user: "1000:1000"
+    # --- P5 FIX: Use PUID/PGID from .env file ---
+    user: "${PUID:-1000}:${PGID:-1000}"
 
     volumes:
       - ./ddclient/ddclient.conf:/etc/ddclient/ddclient.conf:ro
@@ -205,11 +209,11 @@ services:
       - DD_PROTOCOL=cloudflare
       - DD_ZONE=${CLOUDFLARE_ZONE_ID}
       - DD_HOST=${DDCLIENT_HOSTNAME}
-      # --- P1.3 CHANGE: Use new token file ---
+      # --- P1 CHANGE: Use new token file (from previous step) ---
       - DD_PASSWORD_FILE=/run/secrets/ddclient_api_token
 
     secrets:
-      # --- P1.3 CHANGE: Use new token ---
+      # --- P1 CHANGE: Use new token (from previous step) ---
       - ddclient_api_token
 
     healthcheck:
@@ -250,17 +254,9 @@ secrets:
     file: ./secrets/.docker_secrets/push_installation_id
   push_installation_key:
     file: ./secrets/.docker_secrets/push_installation_key
-  # --- P1.3 CHANGE: Define new split tokens ---
+  # --- P1 CHANGE: Define new split tokens (from previous step) ---
   ddclient_api_token:
     file: ./secrets/.docker_secrets/ddclient_api_token
   fail2ban_api_token:
     file: ./secrets/.docker_secrets/fail2ban_api_token
 
-# Network configuration
-networks:
-  vaultwarden_network:
-    name: ${DOCKER_NETWORK_NAME:-vaultwarden_network}
-    driver: bridge
-    ipam:
-      config:
-        - subnet: 172.20.0.0/16
