@@ -275,8 +275,8 @@ setup_directories() {
     ensure_dir "$state_dir/caddy" 755 "$owner"
     ensure_dir "$state_dir/caddy/data" 755 "$owner"
     ensure_dir "$state_dir/caddy/config" 755 "$owner"
-    ensure_dir "$state_dir/ddclient" 755 "$owner" # Added for ddclient cache
-    ensure_dir "$state_dir/ddclient/cache" 755 "$owner"
+    ensure_dir "$state_dir/ddclient" 755 "$owner"
+    ensure_dir "$state_dir/ddclient/cache" 755 "$owner" # Explicitly create cache dir
 
     # Create log subdirectories
     ensure_dir "$state_dir/logs/caddy" 755 "$owner"
@@ -393,12 +393,11 @@ setup_environment() {
     local real_user
     real_user=$(get_real_user)
     
-    # --- P5 CHANGE: Use UID/GID ---
+    # Use UID/GID
     local real_uid
     real_uid=$(id -u "$real_user")
     local real_gid
     real_gid=$(id -g "$real_user")
-    # --- END P5 CHANGE ---
 
     # Check if .env already exists
     if [[ -f "$env_file" ]]; then
@@ -415,7 +414,7 @@ setup_environment() {
     fi
 
     # Create .env file
-    # Uses explicit paths as requested
+    # Uses explicit paths and adds P10 retention vars
     cat > "$env_file" << EOF
 # VaultWarden-OCI-NG Configuration
 # Generated on $(date)
@@ -433,15 +432,12 @@ PROJECT_STATE_DIR=$state_dir
 # ==========================================================
 # USER & PERMISSIONS (P5 FIX)
 # ==========================================================
-# Set automatically to match the user who ran setup.sh
 UID=$real_uid
 GID=$real_gid
 
 # ==========================================================
 # HOST CONFIGURATION (P7 FIX)
 # ==========================================================
-# CRITICAL: If you use a custom SSH port, set it here to prevent
-# the automated firewall updates from locking you out!
 SSH_PORT=22
 
 # ==========================================================
@@ -455,24 +451,22 @@ DDCLIENT_VERSION=3.11.2
 # ==========================================================
 # SERVICE CONFIGURATION
 # ==========================================================
-# VaultWarden Settings
 VAULTWARDEN_DATA_FOLDER=$state_dir/data
 VAULTWARDEN_LOG_LEVEL=info
 
-# Caddy Settings  
 CADDY_DATA_DIR=$state_dir/caddy
 CADDY_CONFIG_DIR=./caddy
 
-# Fail2ban Settings
 FAIL2BAN_CONFIG_DIR=./fail2ban
 FAIL2BAN_LOG_LEVEL=INFO
 
 # ==========================================================
-# BACKUP CONFIGURATION
+# BACKUP CONFIGURATION (P10 FIX - Granular Retention)
 # ==========================================================
-BACKUP_RETENTION_DAYS=30
+DB_BACKUP_RETENTION_DAYS=14
+FULL_BACKUP_RETENTION_DAYS=30
+EMERGENCY_BACKUP_RETENTION_DAYS=90
 BACKUP_ENCRYPTION=age
-# Rclone Remote Name (REQUIRED for offsite backups)
 RCLONE_REMOTE_NAME=CHANGE_ME
 
 # ==========================================================
@@ -636,7 +630,7 @@ validate_docker_setup() {
 setup_script_permissions() {
     log_info "Setting up script permissions..."
 
-    local scripts=("startup.sh" "health.sh" "backup.sh" "restore.sh" "edit-secrets.sh" 
+    local scripts=("startup.sh" "health.sh" "backup.sh" "restore.sh" "edit-secrets.sh"
                    "update.sh" "maintenance.sh" "cron-setup.sh" "update-cloudflare-ips.sh")
     local real_user
     real_user=$(get_real_user)
@@ -754,7 +748,7 @@ main() {
     setup_initial_secrets || exit 1
     validate_docker_setup || exit 1
     setup_script_permissions || exit 1
-    
+
     # Run Cloudflare IP update script to populate web firewall rules
     log_info "Populating firewall rules for Cloudflare..."
     if ./update-cloudflare-ips.sh; then
@@ -770,7 +764,7 @@ main() {
         log_error "Setup completed with validation errors"
         exit 1
     }
-    
+
     local real_user
     real_user=$(get_real_user)
 
