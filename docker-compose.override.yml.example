@@ -14,10 +14,12 @@ services:
   #   # Custom volume mounts
   #   volumes:
   #     - ./custom-config:/custom:ro
-  #   # Port exposure for development
+  #   # --- WARNING: FOR LOCAL DEBUGGING ONLY. DO NOT EXPOSE ON A PRODUCTION SERVER. ---
+  #   # --- THIS BYPASSES ALL CADDY SECURITY, AUTH, AND RATE LIMITS. ---
+  #   # --- Binds to 127.0.0.1 (localhost) only for safety. ---
   #   ports:
-  #     - "8080:8080"  # Direct access to VaultWarden
-  #     - "3012:3012"  # WebSocket port
+  #     - "127.0.0.1:8080:80"  # Direct access to VaultWarden
+  #     - "127.0.0.1:3012:3012" # WebSocket port
 
   # Caddy service overrides  
   # caddy:
@@ -44,7 +46,7 @@ services:
   #   container_name: vaultwarden_adminer
   #   restart: unless-stopped
   #   ports:
-  #     - "8082:8080"
+  #     - "127.0.0.1:8082:8080" # Bind to localhost only
   #   environment:
   #     - ADMINER_DEFAULT_SERVER=sqlite
   #   volumes:
@@ -56,7 +58,7 @@ services:
   #   container_name: vaultwarden_prometheus
   #   restart: unless-stopped
   #   ports:
-  #     - "9090:9090"
+  #     - "127.0.0.1:9090:9090" # Bind to localhost only
   #   volumes:
   #     - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
   #     - prometheus_data:/prometheus
