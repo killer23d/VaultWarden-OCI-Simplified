@@ -45,7 +45,7 @@ EXAMPLES:
 
 DESCRIPTION:
     Complete system setup including:
-    - System dependencies (Docker, Age, SOPS, Rclone, Mailutils)
+    - System dependencies (Docker, Age, SOPS, Rclone, Mailutils, Nano)
     - Firewall configuration
     - Age encryption keys
     - Environment configuration
@@ -146,7 +146,8 @@ install_dependencies() {
     }
 
     # Required packages
-    local packages=("docker.io" "docker-compose-plugin" "age" "sops" "ufw" "curl" "jq" "sqlite3" "gzip" "tar" "cron" "rclone" "mailutils")
+    # --- P15 FIX: Added nano ---
+    local packages=("docker.io" "docker-compose-plugin" "age" "sops" "ufw" "curl" "jq" "sqlite3" "gzip" "tar" "cron" "rclone" "mailutils" "nano")
     local missing_packages=()
 
     # Check which packages are missing
@@ -218,29 +219,20 @@ configure_firewall() {
     ufw default deny incoming >/dev/null 2>&1
     ufw default allow outgoing >/dev/null 2>&1
 
-    # --- P7 FIX: Smart SSH Port Detection ---
-    # Allow SSH (be careful not to lock ourselves out)
-    # Priority: 1. $SSH_PORT env var, 2. sshd_config, 3. default 22
+    # Allow SSH (Smart detection)
     local ssh_port="${SSH_PORT:-}"
     if [[ -z "$ssh_port" ]]; then
-        # Grep for the 'Port' directive, ignore comments, get last value
         ssh_port=$(grep -E '^[[:space:]]*Port[[:space:]]+[0-9]+' /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' | tail -1)
     fi
-    # Default to 22 if still empty
     ssh_port="${ssh_port:-22}"
 
     ufw allow "$ssh_port/tcp" comment "SSH" >/dev/null 2>&1
     log_success "SSH access allowed on port $ssh_port"
-    # --- END P7 FIX ---
-
-    # Web rules are handled by update-cloudflare-ips.sh
-    # We will call that script later in main() to populate web rules.
 
     # Enable UFW
     ufw --force enable >/dev/null 2>&1
     log_success "Firewall configured and enabled with SSH access"
 
-    # Show status
     log_info "Firewall status (web rules will be added next):"
     ufw status numbered | head -20
 
@@ -255,18 +247,11 @@ setup_directories() {
     real_user=$(get_real_user)
     local state_dir="/var/lib/vaultwarden"
 
-    # Get user's real GID
     local real_group
-    real_group=$(id -g -n "$real_user")
-    if [[ -z "$real_group" ]]; then
-        real_group="$real_user"
-    fi
+    real_group=$(id -g -n "$real_user") || real_group="$real_user"
     local owner="$real_user:$real_group"
 
-    # Create main directories using library function
     ensure_dir "$state_dir" 755 "$owner"
-
-    # Data directory with stricter permissions
     ensure_dir "$state_dir/data" 700 "$owner"
     log_info "Data directory created with strict permissions (700)"
 
@@ -276,14 +261,12 @@ setup_directories() {
     ensure_dir "$state_dir/caddy/data" 755 "$owner"
     ensure_dir "$state_dir/caddy/config" 755 "$owner"
     ensure_dir "$state_dir/ddclient" 755 "$owner"
-    ensure_dir "$state_dir/ddclient/cache" 755 "$owner" # Explicitly create cache dir
+    ensure_dir "$state_dir/ddclient/cache" 755 "$owner"
 
-    # Create log subdirectories
     ensure_dir "$state_dir/logs/caddy" 755 "$owner"
     ensure_dir "$state_dir/logs/vaultwarden" 755 "$owner"
     ensure_dir "$state_dir/logs/fail2ban" 755 "$owner"
 
-    # Create project directories
     ensure_dir "$PROJECT_ROOT/secrets" 700 "$owner"
     ensure_dir "$PROJECT_ROOT/secrets/keys" 700 "$owner"
     ensure_dir "$PROJECT_ROOT/backups" 755 "$owner"
@@ -303,7 +286,6 @@ setup_age_keys() {
     local private_key_file="$PROJECT_ROOT/secrets/keys/age-key.txt"
     local public_key_file="$PROJECT_ROOT/secrets/keys/age-public-key.txt"
 
-    # Check if keys already exist
     if check_age_key "$private_key_file"; then
         if [[ "$FORCE" == "true" ]]; then
             log_warn "Overwriting existing Age keys (--force specified)"
@@ -317,21 +299,14 @@ setup_age_keys() {
         fi
     fi
 
-    # Generate new keys using library function
     if generate_age_keypair "$private_key_file" "$public_key_file"; then
         log_success "Age encryption keys generated"
 
-        # Set ownership
-        local real_user
+        local real_user real_group
         real_user=$(get_real_user)
-        local real_group
-        real_group=$(id -g -n "$real_user")
-        if [[ -z "$real_group" ]]; then
-            real_group="$real_user"
-        fi
+        real_group=$(id -g -n "$real_user") || real_group="$real_user"
         chown "$real_user:$real_group" "$private_key_file" "$public_key_file"
 
-        # Show public key
         echo ""
         log_info "Age public key (for reference):"
         cat "$public_key_file"
@@ -361,7 +336,6 @@ setup_sops_config() {
     local public_key
     public_key=$(cat "$public_key_file")
 
-    # Create SOPS config
     cat > "$sops_config" << EOF
 creation_rules:
   - path_regex: secrets/.*\.yaml$
@@ -370,14 +344,9 @@ creation_rules:
     age: '$public_key'
 EOF
 
-    # Set ownership
-    local real_user
+    local real_user real_group
     real_user=$(get_real_user)
-    local real_group
-    real_group=$(id -g -n "$real_user")
-    if [[ -z "$real_group" ]]; then
-        real_group="$real_user"
-    fi
+    real_group=$(id -g -n "$real_user") || real_group="$real_user"
     chown "$real_user:$real_group" "$sops_config"
 
     log_success "SOPS configuration created"
@@ -390,16 +359,11 @@ setup_environment() {
 
     local env_file="$PROJECT_ROOT/.env"
     local state_dir="/var/lib/vaultwarden"
-    local real_user
+    local real_user real_uid real_gid
     real_user=$(get_real_user)
-    
-    # Use UID/GID
-    local real_uid
     real_uid=$(id -u "$real_user")
-    local real_gid
     real_gid=$(id -g "$real_user")
 
-    # Check if .env already exists
     if [[ -f "$env_file" ]]; then
         if [[ "$FORCE" == "true" ]]; then
             log_warn "Overwriting existing .env file (--force specified)"
@@ -413,8 +377,6 @@ setup_environment() {
         fi
     fi
 
-    # Create .env file
-    # Uses explicit paths and adds P10 retention vars
     cat > "$env_file" << EOF
 # VaultWarden-OCI-NG Configuration
 # Generated on $(date)
@@ -424,8 +386,6 @@ setup_environment() {
 # ==========================================================
 DOMAIN=$DOMAIN
 ADMIN_EMAIL=$ADMIN_EMAIL
-
-# Project Configuration
 COMPOSE_PROJECT_NAME=vaultwarden
 PROJECT_STATE_DIR=$state_dir
 
@@ -453,10 +413,8 @@ DDCLIENT_VERSION=3.11.2
 # ==========================================================
 VAULTWARDEN_DATA_FOLDER=$state_dir/data
 VAULTWARDEN_LOG_LEVEL=info
-
 CADDY_DATA_DIR=$state_dir/caddy
 CADDY_CONFIG_DIR=./caddy
-
 FAIL2BAN_CONFIG_DIR=./fail2ban
 FAIL2BAN_LOG_LEVEL=INFO
 
@@ -497,15 +455,11 @@ DDCLIENT_MEMORY_LIMIT=64m
 # SMTP_USERNAME=noreply@$DOMAIN
 EOF
 
-    # Set secure permissions using library function
-    secure_file "$env_file" 600
+    # --- P16 FIX: Added error handling ---
+    secure_file "$env_file" 600 || { log_error "Failed to set secure permissions on .env file"; return 1; }
 
-    # Set ownership
     local real_group
-    real_group=$(id -g -n "$real_user")
-    if [[ -z "$real_group" ]]; then
-        real_group="$real_user"
-    fi
+    real_group=$(id -g -n "$real_user") || real_group="$real_user"
     chown "$real_user:$real_group" "$env_file"
 
     log_success "Environment configuration created"
@@ -518,7 +472,6 @@ setup_initial_secrets() {
 
     local secrets_file="$PROJECT_ROOT/secrets/secrets.yaml"
 
-    # Check if secrets already exist
     if [[ -f "$secrets_file" ]]; then
         if [[ "$FORCE" == "true" ]]; then
             log_warn "Overwriting existing secrets (--force specified)"
@@ -529,61 +482,40 @@ setup_initial_secrets() {
         fi
     fi
 
-    # Generate initial secrets using library functions
     local admin_token backup_pass
     admin_token=$(generate_hex_string 32)
     backup_pass=$(generate_secure_string 32)
 
-    # Create initial secrets file (using split tokens)
     cat > "$secrets_file" << EOF
 # VaultWarden-OCI-NG Secrets
 # Generated on $(date)
 # Edit with: ./edit-secrets.sh
 
-# Admin token for VaultWarden admin panel
 admin_token: $admin_token
-
-# Basic auth hash for admin panel protection
-# Generate with bcrypt generator: https://bcrypt-generator.com/
 admin_basic_auth_hash: CHANGE_ME_BCRYPT_HASH
-
-# SMTP configuration (if email notifications desired)
 smtp_password: CHANGE_ME_SMTP_PASSWORD
-
-# Backup encryption passphrase
 backup_passphrase: $backup_pass
-
-# Optional: Push notification keys
 push_installation_id: ""
 push_installation_key: ""
-
-# Cloudflare API token for DDNS (Permissions: Zone:DNS:Edit)
 ddclient_api_token: CHANGE_ME_DDCLIENT_API_TOKEN
-
-# Cloudflare API token for Fail2Ban/Caddy (Permissions: Zone:Firewall Services:Edit)
 fail2ban_api_token: CHANGE_ME_FAIL2BAN_API_TOKEN
 EOF
 
-    # Encrypt secrets using library function
     if sops_encrypt "$secrets_file"; then
         log_success "Initial secrets created and encrypted"
 
-        # Set ownership
-        local real_user
+        # --- P16 FIX: Added error handling ---
+        secure_file "$secrets_file" 600 || { log_error "Failed to set secure permissions on secrets file"; return 1; }
+
+        local real_user real_group
         real_user=$(get_real_user)
-        local real_group
-        real_group=$(id -g -n "$real_user")
-        if [[ -z "$real_group" ]]; then
-            real_group="$real_user"
-        fi
+        real_group=$(id -g -n "$real_user") || real_group="$real_user"
         chown "$real_user:$real_group" "$secrets_file"
 
         log_warn "IMPORTANT: Update placeholder values in secrets:"
         log_info "  Run: ./edit-secrets.sh"
-        log_info "  Update admin_basic_auth_hash with bcrypt hash"
-        log_info "  Update ddclient_api_token (for dynamic DNS)"
-        log_info "  Update fail2ban_api_token (for firewall bans)"
-        log_info "  Configure SMTP password if using email"
+        log_info "  Update admin_basic_auth_hash, ddclient_api_token, fail2ban_api_token"
+        log_info "  Configure smtp_password if using email"
     else
         log_error "Failed to encrypt secrets file"
         return 1
@@ -596,22 +528,18 @@ EOF
 validate_docker_setup() {
     log_info "Validating Docker setup..."
 
-    # Check Docker daemon using library function
     if ! check_docker_available; then
         log_error "Docker daemon not accessible"
         log_info "Try: sudo systemctl restart docker"
         return 1
     fi
 
-    # Check Docker Compose using library function
     if ! check_compose_available; then
         log_error "Docker Compose not available"
         return 1
     fi
 
-    # Validate compose file using library function
     if [[ -f "$PROJECT_ROOT/docker-compose.yml" ]]; then
-        # Must load .env first for compose validation to work
         load_env_file "$PROJECT_ROOT/.env" || log_warn "Cannot load .env for validation"
         if validate_compose_file "$PROJECT_ROOT/docker-compose.yml"; then
             log_success "Docker Compose configuration is valid"
@@ -632,14 +560,10 @@ setup_script_permissions() {
 
     local scripts=("startup.sh" "health.sh" "backup.sh" "restore.sh" "edit-secrets.sh"
                    "update.sh" "maintenance.sh" "cron-setup.sh" "update-cloudflare-ips.sh")
-    local real_user
+    local real_user real_group owner
     real_user=$(get_real_user)
-    local real_group
-    real_group=$(id -g -n "$real_user")
-    if [[ -z "$real_group" ]]; then
-        real_group="$real_user"
-    fi
-    local owner="$real_user:$real_group"
+    real_group=$(id -g -n "$real_user") || real_group="$real_user"
+    owner="$real_user:$real_group"
 
     for script in "${scripts[@]}"; do
         if [[ -f "$PROJECT_ROOT/$script" ]]; then
@@ -651,10 +575,9 @@ setup_script_permissions() {
         fi
     done
 
-    # Make library files readable
     if [[ -d "$PROJECT_ROOT/lib" ]]; then
         chmod -R 644 "$PROJECT_ROOT/lib"/*.sh
-        chmod +x "$PROJECT_ROOT/lib"  # Directory needs execute
+        chmod +x "$PROJECT_ROOT/lib"
         chown -R "$owner" "$PROJECT_ROOT/lib"
         log_success "Library permissions set"
     fi
@@ -668,15 +591,22 @@ run_final_validation() {
 
     local validation_errors=0
 
-    # Check Age key
-    if check_age_key; then
-        log_success "Age encryption key is accessible"
+    # --- P16 FIX: Added error handling (Age Key needs separate check as secure_file not called here) ---
+    local age_key_file="$PROJECT_ROOT/secrets/keys/age-key.txt"
+    if [[ -f "$age_key_file" ]]; then
+        local perms
+        perms=$(stat -c "%a" "$age_key_file" 2>/dev/null)
+        if [[ "$perms" == "600" ]]; then
+             log_success "Age encryption key is accessible and secure"
+        else
+             log_error "Age encryption key permissions are incorrect (should be 600)"
+             ((validation_errors++))
+        fi
     else
-        log_error "Age encryption key validation failed"
+        log_error "Age encryption key validation failed (file missing)"
         ((validation_errors++))
     fi
 
-    # Check SOPS config
     if [[ -f ".sops.yaml" ]]; then
         log_success "SOPS configuration exists"
     else
@@ -684,7 +614,6 @@ run_final_validation() {
         ((validation_errors++))
     fi
 
-    # Check environment file
     if [[ -f ".env" ]]; then
         log_success "Environment configuration exists"
     else
@@ -692,7 +621,6 @@ run_final_validation() {
         ((validation_errors++))
     fi
 
-    # Check secrets
     local secrets_file="secrets/secrets.yaml"
     if [[ -f "$secrets_file" ]] && is_sops_encrypted "$secrets_file"; then
         log_success "Encrypted secrets file exists"
@@ -701,7 +629,6 @@ run_final_validation() {
         ((validation_errors++))
     fi
 
-    # Test network connectivity using library function
     if test_connectivity; then
         log_success "Network connectivity available"
     else
@@ -723,7 +650,6 @@ main() {
 
     validate_setup_environment || exit 1
 
-    # Interactive setup if domain/email not provided
     if [[ -z "$DOMAIN" || -z "$ADMIN_EMAIL" ]]; then
         if [[ "$AUTO_MODE" == "true" ]]; then
             log_error "Auto mode requires --domain and --email"
@@ -732,13 +658,11 @@ main() {
         interactive_setup
     fi
 
-    # Load any existing configuration
     load_env_file 2>/dev/null || log_info "No existing .env file found"
 
     echo ""
     log_info "Starting system setup..."
 
-    # Execute setup steps
     install_dependencies || exit 1
     configure_firewall || exit 1
     setup_directories || exit 1
@@ -749,7 +673,6 @@ main() {
     validate_docker_setup || exit 1
     setup_script_permissions || exit 1
 
-    # Run Cloudflare IP update script to populate web firewall rules
     log_info "Populating firewall rules for Cloudflare..."
     if ./update-cloudflare-ips.sh; then
         log_success "Firewall rules for Cloudflare IPs applied"
@@ -773,13 +696,9 @@ main() {
     echo ""
     echo "Next steps:"
     echo "  1. Update secrets: ./edit-secrets.sh"
-    echo "     • CRITICAL: Set admin_basic_auth_hash for Caddy admin protection"
-    echo "     • CRITICAL: Set ddclient_api_token (for DNS)"
-    echo "     • CRITICAL: Set fail2ban_api_token (for firewall)"
-    echo "     • Configure SMTP password if using email notifications"
+    echo "     • CRITICAL: Set admin_basic_auth_hash, ddclient_api_token, fail2ban_api_token"
     echo "  2. Review configuration: nano .env"
-    echo "     • CRITICAL: Set CLOUDFLARE_ZONE_ID"
-    echo "     • CRITICAL: Set RCLONE_REMOTE_NAME"
+    echo "     • CRITICAL: Set CLOUDFLARE_ZONE_ID, RCLONE_REMOTE_NAME"
     echo "     • NOTE: Set SSH_PORT if you use a custom port"
     echo "  3. Configure Rclone: rclone config (for the user '$real_user')"
     echo "  4. Start services: ./startup.sh"
@@ -789,9 +708,7 @@ main() {
     echo "Your VaultWarden will be available at: https://$DOMAIN"
     echo "Admin panel: https://$DOMAIN/admin (protected by basic auth)"
     echo ""
-    log_warn "IMPORTANT: The admin panel requires admin_basic_auth_hash to be configured!"
-    log_warn "IMPORTANT: The stack requires CLOUDFLARE_ZONE_ID and API tokens to function!"
-    log_warn "IMPORTANT: Offsite backup requires rclone to be configured and RCLONE_REMOTE_NAME to be set!"
+    log_warn "IMPORTANT: Ensure all 'CHANGE_ME' values are updated!"
     log_info "Setup completed on $(date)"
 }
 
