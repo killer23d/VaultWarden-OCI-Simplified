@@ -78,7 +78,7 @@ prepare_docker_secrets() {
         log_error "Secrets file is not encrypted with SOPS"
         return 1
     fi
-    
+
     # --- FIX #3: Robust secrets parsing with jq ---
     if ! has_command jq; then
         log_error "jq command not found. Cannot parse secrets."
@@ -98,7 +98,7 @@ prepare_docker_secrets() {
     for secret in "${secrets[@]}"; do
         local value
         secret_file_path="$docker_secrets_dir/$secret"
-        
+
         # Use jq to safely extract the value, defaulting to "CHANGE_ME" if null/missing
         value=$(echo "$decrypted_json" | jq -r --arg secret "$secret" '.[$secret] // "CHANGE_ME"')
 
@@ -111,7 +111,7 @@ prepare_docker_secrets() {
                 log_warn "Secret '$secret' not configured or has placeholder value"
             fi
         fi
-        
+
         secure_file "$secret_file_path" 600 || { log_error "Failed to secure temporary secret file: $secret"; return 1; }
     done
     # --- END FIX #3 ---
@@ -124,8 +124,16 @@ prepare_docker_secrets() {
 prepare_environment_variables() {
     log_info "Preparing environment variables for containers..."
 
+    # --- P4 FIX: Use jq for consistency and robustness ---
+    local decrypted_json
+    decrypted_json=$(sops -d --output-type json "secrets/secrets.yaml" 2>/dev/null) || {
+        log_error "Failed to decrypt secrets for environment variables. Check age key and sops config."
+        return 1
+    }
+
     local admin_basic_auth_hash
-    if admin_basic_auth_hash=$(get_secret "admin_basic_auth_hash" 2>/dev/null) && [[ -n "$admin_basic_auth_hash" ]] && [[ "$admin_basic_auth_hash" != "CHANGE_ME"* ]]; then
+    admin_basic_auth_hash=$(echo "$decrypted_json" | jq -r '.admin_basic_auth_hash // ""')
+    if [[ -n "$admin_basic_auth_hash" ]] && [[ "$admin_basic_auth_hash" != "CHANGE_ME"* ]]; then
         export ADMIN_BASIC_AUTH_HASH="$admin_basic_auth_hash"
         log_success "Admin basic auth hash loaded"
     else
@@ -134,7 +142,8 @@ prepare_environment_variables() {
     fi
 
     local ddclient_token
-    if ddclient_token=$(get_secret "ddclient_api_token" 2>/dev/null) && [[ -n "$ddclient_token" ]] && [[ "$ddclient_token" != "CHANGE_ME"* ]] && [[ "$ddclient_token" != "" ]]; then
+    ddclient_token=$(echo "$decrypted_json" | jq -r '.ddclient_api_token // ""')
+    if [[ -n "$ddclient_token" ]] && [[ "$ddclient_token" != "CHANGE_ME"* ]] && [[ "$ddclient_token" != "" ]]; then
         export DDCLIENT_API_TOKEN="$ddclient_token"
         log_success "DDClient API token loaded"
     else
@@ -143,17 +152,20 @@ prepare_environment_variables() {
     fi
 
     local fail2ban_token
-    if fail2ban_token=$(get_secret "fail2ban_api_token" 2>/dev/null) && [[ -n "$fail2ban_token" ]] && [[ "$fail2ban_token" != "CHANGE_ME"* ]] && [[ "$fail2ban_token" != "" ]]; then
+    fail2ban_token=$(echo "$decrypted_json" | jq -r '.fail2ban_api_token // ""')
+    if [[ -n "$fail2ban_token" ]] && [[ "$fail2ban_token" != "CHANGE_ME"* ]] && [[ "$fail2ban_token" != "" ]]; then
         export FAIL2BAN_API_TOKEN="$fail2ban_token"
         log_success "Fail2Ban/Caddy API token loaded"
     else
         export FAIL2BAN_API_TOKEN=""
         log_warn "Fail2Ban/Caddy API token not configured - Fail2Ban bans and Caddy ACME DNS challenge might fail!"
     fi
+    # --- END P4 FIX ---
 
     log_success "Secrets exported to environment"
     return 0
 }
+
 
 # --- Post-Startup Health Check ---
 post_startup_health_check() {
@@ -263,3 +275,4 @@ main() {
 }
 
 main "$@"
+
