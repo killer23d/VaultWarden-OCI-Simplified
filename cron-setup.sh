@@ -66,11 +66,9 @@ validate_environment() {
     fi
 
     # Check required commands using library function
-    # --- FIX: Added 'docker' for Cloudflare IP update script ---
     require_commands crontab rclone mail docker || return 1
 
     # Ensure project scripts are executable
-    # --- FIX: Added 'update-cloudflare-ips.sh' ---
     local scripts=("backup.sh" "health.sh" "update.sh" "update-cloudflare-ips.sh")
     for script in "${scripts[@]}"; do
         if [[ ! -f "$PROJECT_ROOT/$script" ]]; then
@@ -133,30 +131,30 @@ install_vaultwarden_crons() {
 
     # Define cron jobs
     local cron_jobs
-    # --- FIX: Redirect all cron output to logs/cron.log to catch silent failures ---
+    # --- P11 FIX: Explicitly source .env in each job ---
+    # Redirect all cron output to logs/cron.log
     read -r -d '' cron_jobs << EOF || true
 # VaultWarden-OCI-NG Automated Tasks
 # Generated on $(date)
 
 # Daily database backup at 2:00 AM, with rclone sync and email
-0 2 * * * $real_user cd $PROJECT_ROOT && ./backup.sh --type db --rclone --email >> $PROJECT_ROOT/logs/cron.log 2>&1
+0 2 * * * $real_user cd $PROJECT_ROOT && source .env && ./backup.sh --type db --rclone --email >> $PROJECT_ROOT/logs/cron.log 2>&1
 
 # Weekly full backup on Sunday at 1:00 AM, with rclone sync and email
-0 1 * * 0 $real_user cd $PROJECT_ROOT && ./backup.sh --type full --rclone --email >> $PROJECT_ROOT/logs/cron.log 2>&1
+0 1 * * 0 $real_user cd $PROJECT_ROOT && source .env && ./backup.sh --type full --rclone --email >> $PROJECT_ROOT/logs/cron.log 2>&1
 
 # Health check every 6 hours with auto-heal and email on failure
-0 */6 * * * $real_user cd $PROJECT_ROOT && ./health.sh --auto-heal --quiet --email-alert >> $PROJECT_ROOT/logs/cron.log 2>&1
+0 */6 * * * $real_user cd $PROJECT_ROOT && source .env && ./health.sh --auto-heal --quiet --email-alert >> $PROJECT_ROOT/logs/cron.log 2>&1
 
 # Weekly container updates on Sunday at 3:00 AM (sends email)
-0 3 * * 0 $real_user cd $PROJECT_ROOT && ./update.sh --type containers --force >> $PROJECT_ROOT/logs/cron.log 2>&1
+0 3 * * 0 $real_user cd $PROJECT_ROOT && source .env && ./update.sh --type containers --force >> $PROJECT_ROOT/logs/cron.log 2>&1
 
 # Monthly system updates on first Sunday at 4:00 AM (sends email, auto-reboots)
-0 4 1-7 * 0 root cd $PROJECT_ROOT && ./update.sh --type system --force >> $PROJECT_ROOT/logs/cron.log 2>&1
+0 4 1-7 * 0 root cd $PROJECT_ROOT && source .env && ./update.sh --type system --force >> $PROJECT_ROOT/logs/cron.log 2>&1
 
-# --- FIX: Use dedicated script for Cloudflare IP update ---
 # Weekly Cloudflare IP update on Monday at 5:00 AM (runs as root, sends email on failure)
-0 5 * * 1 root cd $PROJECT_ROOT && ./update-cloudflare-ips.sh >> $PROJECT_ROOT/logs/cron.log 2>&1
-# --- END FIX ---
+0 5 * * 1 root cd $PROJECT_ROOT && source .env && ./update-cloudflare-ips.sh >> $PROJECT_ROOT/logs/cron.log 2>&1
+# --- END P11 FIX ---
 
 EOF
 
@@ -173,7 +171,8 @@ EOF
     setup_cleanup_trap "rm -f '$temp_file'"
 
     # Ensure log directory exists for cron output
-    ensure_dir "$PROJECT_ROOT/logs" 755 "$real_user:$real_user"
+    local real_group=$(id -g -n "$real_user") || real_group="$real_user"
+    ensure_dir "$PROJECT_ROOT/logs" 755 "$real_user:$real_group"
 
     # Remove any existing VaultWarden crons first
     if [[ -n "$current_crons" ]]; then
@@ -237,6 +236,7 @@ setup_log_rotation() {
     state_dir=$(get_config_value "PROJECT_STATE_DIR" "/var/lib/vaultwarden")
     local real_user
     real_user=$(get_real_user)
+    local real_group=$(id -g -n "$real_user") || real_group="$real_user"
 
 
     if [[ "$DRY_RUN" == "true" ]]; then
@@ -254,10 +254,13 @@ $state_dir/logs/*/*.log {
     delaycompress
     missingok
     notifempty
-    create 644 $real_user $real_user
+    create 644 $real_user $real_group
     postrotate
-        # Send HUP signal to containers to reopen log files if needed
-        # docker compose -f $PROJECT_ROOT/docker-compose.yml kill -s HUP caddy || true
+        # Signal containers to reopen log files if needed
+        if [ -f "$PROJECT_ROOT/docker-compose.yml" ]; then
+             docker compose -f "$PROJECT_ROOT/docker-compose.yml" exec caddy caddy reload --config /etc/caddy/Caddyfile > /dev/null 2>&1 || true
+             docker compose -f "$PROJECT_ROOT/docker-compose.yml" exec fail2ban fail2ban-client flushlogs > /dev/null 2>&1 || true
+        fi
     endscript
 }
 
@@ -269,7 +272,7 @@ $PROJECT_ROOT/logs/cron.log {
     delaycompress
     missingok
     notifempty
-    create 644 $real_user $real_user
+    create 644 $real_user $real_group
 }
 
 # Rotate project backup script logs (if any are created)
