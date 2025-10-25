@@ -159,19 +159,26 @@ reload_caddy() {
         log_warn "Attempting to restore previous IP list from backup..."
 
         if [[ -f "$backup_file" ]]; then
-            if mv "$backup_file" "$final_file"; then
-                log_info "Successfully restored previous IP list. Reloading Caddy again..."
-                if docker compose exec caddy caddy reload --config /etc/caddy/Caddyfile > /dev/null; then
-                     log_success "Caddy reloaded successfully with restored IP list."
-                else
-                     log_error "Failed to reload Caddy even after restoring backup. Manual intervention required."
-                fi
-            else
+            # --- FIX: Added exit 1 on failure to restore backup ---
+            if ! mv "$backup_file" "$final_file"; then
                 log_error "Failed to restore backup file $backup_file. Manual intervention required."
+                exit 1 # Hard exit if restore mv fails
             fi
+            log_info "Successfully restored previous IP list. Reloading Caddy again..."
+            if docker compose exec caddy caddy reload --config /etc/caddy/Caddyfile > /dev/null; then
+                 log_success "Caddy reloaded successfully with restored IP list."
+                 # Still return 1 to indicate initial failure, but it's recovered state
+                 return 1
+            else
+                 log_error "Failed to reload Caddy even after restoring backup. Manual intervention required."
+                 exit 1 # Hard exit if restore + reload fails
+            fi
+            # --- END FIX ---
         else
             log_error "No backup file found to restore. Manual intervention required."
+            exit 1 # Hard exit if no backup found
         fi
+        # This part should not be reached due to exit calls above
         return 1
     fi
 }
@@ -229,7 +236,8 @@ main() {
 
     # Reload Caddy
     if ! reload_caddy; then
-        log_error "Caddy reload failed."
+        # reload_caddy function now handles exit on critical failure
+        log_error "Caddy reload process encountered errors."
         return 1
     fi
 
@@ -248,3 +256,4 @@ if ! main "$@"; then
 fi
 
 exit 0
+
