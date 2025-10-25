@@ -162,9 +162,10 @@ services:
       - ${PROJECT_STATE_DIR:-/var/lib/vaultwarden}/logs/vaultwarden:/var/log/vaultwarden:ro
       - ${PROJECT_STATE_DIR:-/var/lib/vaultwarden}/logs/fail2ban:/var/log:rw
 
-    cap_add:
-      - NET_ADMIN
-      - NET_RAW
+    # --- FIX: Removed unnecessary cap_add. Not needed for Cloudflare API ban action. ---
+    # cap_add:
+    #   - NET_ADMIN
+    #   - NET_RAW
 
     healthcheck:
       test: ["CMD-SHELL", "fail2ban-client ping"]
