@@ -86,7 +86,6 @@ services:
     image: caddy:${CADDY_VERSION:-2.8.4}
     container_name: vaultwarden_caddy
     restart: unless-stopped
-    # --- P5 CHANGE: Use UID/GID from .env file ---
     user: "${UID:-1000}:${GID:-1000}"
 
     environment:
@@ -120,7 +119,7 @@ services:
       interval: 60s
       timeout: 15s
       retries: 5
-      start_period: 30s
+      start_period: 60s
 
     logging:
       driver: "json-file"
