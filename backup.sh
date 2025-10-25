@@ -368,10 +368,18 @@ rclone_sync_offsite() {
     
     local remote_path="$remote_name:vaultwarden_backups"
     
-    log_info "Syncing local backup directory to remote: $remote_path"
+    # --- P6 FIX: Copy only the specific encrypted file ---
+    local backup_filename
+    backup_filename=$(basename "$backup_file_path")
+    local backup_type_dir
+    backup_type_dir=$(basename "$(dirname "$backup_file_path")") # 'db', 'full', 'emergency'
+    local remote_file_path="$remote_path/$backup_type_dir/$backup_filename"
+
+    log_info "Syncing '$backup_filename' to remote: $remote_file_path"
     
-    # We sync the whole backup directory to keep it simple
-    if ! rclone copy "$PROJECT_ROOT/backups" "$remote_path"; then
+    # We sync the single file, not the whole directory, to prevent race conditions
+    if ! rclone copyto "$backup_file_path" "$remote_file_path"; then
+    # --- END P6 FIX ---
         log_error "Rclone sync failed"
         return 1
     fi
@@ -380,14 +388,12 @@ rclone_sync_offsite() {
     
     # --- Start User Suggestion: Backup Size Validation ---
     log_info "Verifying remote backup file..."
-    local backup_filename
-    backup_filename=$(basename "$backup_file_path")
-    local remote_file_path="$remote_path/$(basename "$(dirname "$backup_file_path")")/$backup_filename"
-
+    
     local local_size
     local_size=$(du -b "$backup_file_path" | cut -f1)
     
     local remote_size_json
+    # remote_file_path is already defined above for the P6 fix
     remote_size_json=$(rclone size "$remote_file_path" --json 2>/dev/null)
     
     if [[ -z "$remote_size_json" ]]; then
