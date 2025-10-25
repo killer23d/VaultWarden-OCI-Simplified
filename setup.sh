@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # setup.sh - Complete VaultWarden-OCI-NG system setup with library integration
+# Corrected version addressing v4 review feedback
 
 set -euo pipefail
 
@@ -144,10 +145,8 @@ install_dependencies() {
         return 1
     }
 
-    # --- START P1/P2: Add rclone and mailutils ---
     # Required packages
     local packages=("docker.io" "docker-compose-plugin" "age" "sops" "ufw" "curl" "jq" "sqlite3" "gzip" "tar" "cron" "rclone" "mailutils")
-    # --- END P1/P2 ---
     local missing_packages=()
 
     # Check which packages are missing
@@ -234,9 +233,8 @@ configure_firewall() {
     log_success "SSH access allowed on port $ssh_port"
     # --- END P7 FIX ---
 
-    # --- FIX: Web rules are now handled by update-cloudflare-ips.sh ---
+    # Web rules are handled by update-cloudflare-ips.sh
     # We will call that script later in main() to populate web rules.
-    # This function now ONLY handles the basics.
 
     # Enable UFW
     ufw --force enable >/dev/null 2>&1
@@ -257,19 +255,18 @@ setup_directories() {
     real_user=$(get_real_user)
     local state_dir="/var/lib/vaultwarden"
 
-    # --- P5 FIX: Get user's real GID ---
+    # Get user's real GID
     local real_group
     real_group=$(id -g -n "$real_user")
     if [[ -z "$real_group" ]]; then
         real_group="$real_user"
     fi
     local owner="$real_user:$real_group"
-    # --- END P5 FIX ---
 
     # Create main directories using library function
     ensure_dir "$state_dir" 755 "$owner"
 
-    # Data directory with stricter permissions (addresses v4 review)
+    # Data directory with stricter permissions
     ensure_dir "$state_dir/data" 700 "$owner"
     log_info "Data directory created with strict permissions (700)"
 
@@ -278,6 +275,8 @@ setup_directories() {
     ensure_dir "$state_dir/caddy" 755 "$owner"
     ensure_dir "$state_dir/caddy/data" 755 "$owner"
     ensure_dir "$state_dir/caddy/config" 755 "$owner"
+    ensure_dir "$state_dir/ddclient" 755 "$owner" # Added for ddclient cache
+    ensure_dir "$state_dir/ddclient/cache" 755 "$owner"
 
     # Create log subdirectories
     ensure_dir "$state_dir/logs/caddy" 755 "$owner"
@@ -291,8 +290,6 @@ setup_directories() {
     ensure_dir "$PROJECT_ROOT/backups/db" 755 "$owner"
     ensure_dir "$PROJECT_ROOT/backups/full" 755 "$owner"
     ensure_dir "$PROJECT_ROOT/backups/emergency" 755 "$owner"
-
-    # --- FIX: Ensure logs directory exists for cron output ---
     ensure_dir "$PROJECT_ROOT/logs" 755 "$owner"
 
     log_success "Directory structure created with appropriate permissions"
@@ -327,14 +324,12 @@ setup_age_keys() {
         # Set ownership
         local real_user
         real_user=$(get_real_user)
-        # --- P5 FIX: Get user's real GID ---
         local real_group
         real_group=$(id -g -n "$real_user")
         if [[ -z "$real_group" ]]; then
             real_group="$real_user"
         fi
         chown "$real_user:$real_group" "$private_key_file" "$public_key_file"
-        # --- END P5 FIX ---
 
         # Show public key
         echo ""
@@ -378,14 +373,12 @@ EOF
     # Set ownership
     local real_user
     real_user=$(get_real_user)
-    # --- P5 FIX: Get user's real GID ---
     local real_group
     real_group=$(id -g -n "$real_user")
     if [[ -z "$real_group" ]]; then
         real_group="$real_user"
     fi
     chown "$real_user:$real_group" "$sops_config"
-    # --- END P5 FIX ---
 
     log_success "SOPS configuration created"
     return 0
@@ -397,15 +390,15 @@ setup_environment() {
 
     local env_file="$PROJECT_ROOT/.env"
     local state_dir="/var/lib/vaultwarden"
-    # --- P5 FIX: Get real user and group IDs ---
     local real_user
     real_user=$(get_real_user)
+    
+    # --- P5 CHANGE: Use UID/GID ---
     local real_uid
     real_uid=$(id -u "$real_user")
     local real_gid
     real_gid=$(id -g "$real_user")
-    # --- END P5 FIX ---
-
+    # --- END P5 CHANGE ---
 
     # Check if .env already exists
     if [[ -f "$env_file" ]]; then
@@ -421,98 +414,107 @@ setup_environment() {
         fi
     fi
 
-    # Create .env file with explicit version definitions (addresses v4 review)
+    # Create .env file
+    # Uses explicit paths as requested
     cat > "$env_file" << EOF
 # VaultWarden-OCI-NG Configuration
 # Generated on $(date)
 
-# Domain Configuration
+# ==========================================================
+# CORE CONFIGURATION (REQUIRED)
+# ==========================================================
 DOMAIN=$DOMAIN
 ADMIN_EMAIL=$ADMIN_EMAIL
 
 # Project Configuration
-PROJECT_NAME=vaultwarden-oci
-PROJECT_STATE_DIR=$state_dir
 COMPOSE_PROJECT_NAME=vaultwarden
+PROJECT_STATE_DIR=$state_dir
 
-# --- P5 FIX: Add PUID/PGID ---
-# User/Group IDs for container permissions
+# ==========================================================
+# USER & PERMISSIONS (P5 FIX)
+# ==========================================================
 # Set automatically to match the user who ran setup.sh
-PUID=$real_uid
-PGID=$real_gid
-# --- END P5 FIX ---
+UID=$real_uid
+GID=$real_gid
 
-# --- P7 NOTE: Add SSH_PORT ---
-# Custom SSH port (if not 22)
-# IMPORTANT: If you use a custom SSH port, set it here to prevent
-# the automated firewall from locking you out.
-# SSH_PORT=2222
-# --- END P7 NOTE ---
+# ==========================================================
+# HOST CONFIGURATION (P7 FIX)
+# ==========================================================
+# CRITICAL: If you use a custom SSH port, set it here to prevent
+# the automated firewall updates from locking you out!
+SSH_PORT=22
 
-# Container Versions (Single source of truth per v4 review)
+# ==========================================================
+# CONTAINER VERSIONS
+# ==========================================================
 VAULTWARDEN_VERSION=1.30.5
 CADDY_VERSION=2.8.4
 FAIL2BAN_VERSION=1.1.0
 DDCLIENT_VERSION=3.11.2
 
-# VaultWarden Configuration
+# ==========================================================
+# SERVICE CONFIGURATION
+# ==========================================================
+# VaultWarden Settings
 VAULTWARDEN_DATA_FOLDER=$state_dir/data
 VAULTWARDEN_LOG_LEVEL=info
 
-# Caddy Configuration
+# Caddy Settings  
 CADDY_DATA_DIR=$state_dir/caddy
-CADDY_CONFIG_DIR=$PROJECT_ROOT/caddy
+CADDY_CONFIG_DIR=./caddy
 
-# fail2ban Configuration
-FAIL2BAN_CONFIG_DIR=$PROJECT_ROOT/fail2ban
+# Fail2ban Settings
+FAIL2BAN_CONFIG_DIR=./fail2ban
 FAIL2BAN_LOG_LEVEL=INFO
 
-# Backup Configuration
+# ==========================================================
+# BACKUP CONFIGURATION
+# ==========================================================
 BACKUP_RETENTION_DAYS=30
 BACKUP_ENCRYPTION=age
-# --- START P1: Add Rclone config ---
-# Rclone remote name (configure with 'rclone config')
-RCLONE_REMOTE_NAME=MyCloudStorage
-# --- END P1 ---
+# Rclone Remote Name (REQUIRED for offsite backups)
+RCLONE_REMOTE_NAME=CHANGE_ME
 
-# Network Configuration
+# ==========================================================
+# NETWORK CONFIGURATION
+# ==========================================================
 DOCKER_NETWORK_NAME=vaultwarden_network
 
-# Resource Limits (for small VMs)
+# ==========================================================
+# CLOUDFLARE & DYNAMIC DNS (REQUIRED)
+# ==========================================================
+CLOUDFLARE_ZONE_ID=CHANGE_ME
+DDCLIENT_HOSTNAME=$DOMAIN
+
+# ==========================================================
+# RESOURCE LIMITS
+# ==========================================================
 VAULTWARDEN_MEMORY_LIMIT=1g
 CADDY_MEMORY_LIMIT=128m
 FAIL2BAN_MEMORY_LIMIT=64m
+DDCLIENT_MEMORY_LIMIT=64m
 
-# --- Cloudflare & DDClient (REQUIRED) ---
-# Find this on your Cloudflare dashboard (REQUIRED for fail2ban/ddclient)
-CLOUDFLARE_ZONE_ID=CHANGE_ME
-# The full domain name to update (e.g., $DOMAIN)
-DDCLIENT_HOSTNAME=$DOMAIN
-
-# Optional: SMTP Configuration (configure in secrets)
+# ==========================================================
+# OPTIONAL: SMTP CONFIGURATION
+# ==========================================================
 # SMTP_HOST=smtp.example.com
 # SMTP_PORT=587
 # SMTP_SECURITY=starttls
 # SMTP_USERNAME=noreply@$DOMAIN
-
-# Optional: Cloudflare Configuration (configure in secrets)
-# CF_ZONE_API_TOKEN=<configure-in-secrets>
 EOF
 
     # Set secure permissions using library function
     secure_file "$env_file" 600
 
     # Set ownership
-    # --- P5 FIX: Use correct owner variables ---
     local real_group
     real_group=$(id -g -n "$real_user")
     if [[ -z "$real_group" ]]; then
         real_group="$real_user"
     fi
     chown "$real_user:$real_group" "$env_file"
-    # --- END P5 FIX ---
 
-    log_success "Environment configuration created with explicit version definitions"
+    log_success "Environment configuration created"
     return 0
 }
 
@@ -538,7 +540,7 @@ setup_initial_secrets() {
     admin_token=$(generate_hex_string 32)
     backup_pass=$(generate_secure_string 32)
 
-    # Create initial secrets file
+    # Create initial secrets file (using split tokens)
     cat > "$secrets_file" << EOF
 # VaultWarden-OCI-NG Secrets
 # Generated on $(date)
@@ -549,7 +551,6 @@ admin_token: $admin_token
 
 # Basic auth hash for admin panel protection
 # Generate with bcrypt generator: https://bcrypt-generator.com/
-# This is used by Caddy for /admin protection
 admin_basic_auth_hash: CHANGE_ME_BCRYPT_HASH
 
 # SMTP configuration (if email notifications desired)
@@ -558,10 +559,10 @@ smtp_password: CHANGE_ME_SMTP_PASSWORD
 # Backup encryption passphrase
 backup_passphrase: $backup_pass
 
-# Optional: Push notification key
+# Optional: Push notification keys
+push_installation_id: ""
 push_installation_key: ""
 
-# --- P1 CHANGE: Split Cloudflare token (from previous step) ---
 # Cloudflare API token for DDNS (Permissions: Zone:DNS:Edit)
 ddclient_api_token: CHANGE_ME_DDCLIENT_API_TOKEN
 
@@ -576,23 +577,19 @@ EOF
         # Set ownership
         local real_user
         real_user=$(get_real_user)
-        # --- P5 FIX: Get user's real GID ---
         local real_group
         real_group=$(id -g -n "$real_user")
         if [[ -z "$real_group" ]]; then
             real_group="$real_user"
         fi
         chown "$real_user:$real_group" "$secrets_file"
-        # --- END P5 FIX ---
-
 
         log_warn "IMPORTANT: Update placeholder values in secrets:"
         log_info "  Run: ./edit-secrets.sh"
         log_info "  Update admin_basic_auth_hash with bcrypt hash"
-        log_info "  Configure SMTP password if using email"
-        # --- P1 CHANGE: Updated help text (from previous step) ---
         log_info "  Update ddclient_api_token (for dynamic DNS)"
         log_info "  Update fail2ban_api_token (for firewall bans)"
+        log_info "  Configure SMTP password if using email"
     else
         log_error "Failed to encrypt secrets file"
         return 1
@@ -620,6 +617,8 @@ validate_docker_setup() {
 
     # Validate compose file using library function
     if [[ -f "$PROJECT_ROOT/docker-compose.yml" ]]; then
+        # Must load .env first for compose validation to work
+        load_env_file "$PROJECT_ROOT/.env" || log_warn "Cannot load .env for validation"
         if validate_compose_file "$PROJECT_ROOT/docker-compose.yml"; then
             log_success "Docker Compose configuration is valid"
         else
@@ -641,14 +640,12 @@ setup_script_permissions() {
                    "update.sh" "maintenance.sh" "cron-setup.sh" "update-cloudflare-ips.sh")
     local real_user
     real_user=$(get_real_user)
-    # --- P5 FIX: Get user's real GID ---
     local real_group
     real_group=$(id -g -n "$real_user")
     if [[ -z "$real_group" ]]; then
         real_group="$real_user"
     fi
     local owner="$real_user:$real_group"
-    # --- END P5 FIX ---
 
     for script in "${scripts[@]}"; do
         if [[ -f "$PROJECT_ROOT/$script" ]]; then
@@ -758,7 +755,7 @@ main() {
     validate_docker_setup || exit 1
     setup_script_permissions || exit 1
     
-    # --- FIX: Run Cloudflare IP update script to populate web firewall rules ---
+    # Run Cloudflare IP update script to populate web firewall rules
     log_info "Populating firewall rules for Cloudflare..."
     if ./update-cloudflare-ips.sh; then
         log_success "Firewall rules for Cloudflare IPs applied"
@@ -766,7 +763,6 @@ main() {
         log_error "Failed to apply Cloudflare IP firewall rules"
         log_warn "Your firewall may be blocking web traffic. Run './update-cloudflare-ips.sh' manually."
     fi
-    # --- END FIX ---
 
     echo ""
     log_info "Running final validation..."
@@ -774,6 +770,9 @@ main() {
         log_error "Setup completed with validation errors"
         exit 1
     }
+    
+    local real_user
+    real_user=$(get_real_user)
 
     echo ""
     log_success "🎉 VaultWarden-OCI-NG setup completed successfully!"
@@ -799,7 +798,7 @@ main() {
     log_warn "IMPORTANT: The admin panel requires admin_basic_auth_hash to be configured!"
     log_warn "IMPORTANT: The stack requires CLOUDFLARE_ZONE_ID and API tokens to function!"
     log_warn "IMPORTANT: Offsite backup requires rclone to be configured and RCLONE_REMOTE_NAME to be set!"
-    log_info "Setup completed in $(date)"
+    log_info "Setup completed on $(date)"
 }
 
 main "$@"
