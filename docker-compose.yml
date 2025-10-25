@@ -93,7 +93,8 @@ services:
       - DOMAIN=${DOMAIN}
       - EMAIL=${ADMIN_EMAIL}
       - ADMIN_BASIC_AUTH_HASH=${ADMIN_BASIC_AUTH_HASH}
-      - CLOUDFLARE_API_TOKEN_FILE=/run/secrets/cloudflare_api_token
+      # --- P1.3 CHANGE: Use new token for Caddy DNS challenge (if used) ---
+      - CLOUDFLARE_API_TOKEN_FILE=/run/secrets/fail2ban_api_token
 
     ports:
       - "80:80"
@@ -107,7 +108,8 @@ services:
       - ${PROJECT_STATE_DIR:-/var/lib/vaultwarden}/logs/caddy:/logs:rw
 
     secrets:
-      - cloudflare_api_token
+      # --- P1.3 CHANGE: Use new token ---
+      - fail2ban_api_token
       - admin_basic_auth_hash
 
     depends_on:
@@ -151,7 +153,8 @@ services:
       - F2B_DB_PURGE_AGE=1d
       - F2B_MAX_RETRY=3
       - F2B_DEST_EMAIL=${ADMIN_EMAIL}
-      - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN:-} # Read by gomplate in jail.d
+      # --- P1.3 CHANGE: Use new token variable ---
+      - CLOUDFLARE_API_TOKEN=${FAIL2BAN_API_TOKEN:-} # Read by gomplate in jail.d
       - CLOUDFLARE_ZONE_ID=${CLOUDFLARE_ZONE_ID:-}     # Read by gomplate in jail.d
 
     volumes:
@@ -161,11 +164,6 @@ services:
       - ${PROJECT_STATE_DIR:-/var/lib/vaultwarden}/logs/caddy:/var/log/caddy:ro
       - ${PROJECT_STATE_DIR:-/var/lib/vaultwarden}/logs/vaultwarden:/var/log/vaultwarden:ro
       - ${PROJECT_STATE_DIR:-/var/lib/vaultwarden}/logs/fail2ban:/var/log:rw
-
-    # --- FIX: Removed unnecessary cap_add. Not needed for Cloudflare API ban action. ---
-    # cap_add:
-    #   - NET_ADMIN
-    #   - NET_RAW
 
     healthcheck:
       test: ["CMD-SHELL", "fail2ban-client ping"]
@@ -189,7 +187,9 @@ services:
           memory: 32m
           cpus: '0.02'
 
-    network_mode: host
+    # --- P4.1 CHANGE: Removed network_mode: host ---
+    networks:
+      - vaultwarden_network
 
   ddclient:
     image: ddclient/ddclient:${DDCLIENT_VERSION:-3.11.2}
@@ -205,10 +205,12 @@ services:
       - DD_PROTOCOL=cloudflare
       - DD_ZONE=${CLOUDFLARE_ZONE_ID}
       - DD_HOST=${DDCLIENT_HOSTNAME}
-      - DD_PASSWORD_FILE=/run/secrets/cloudflare_api_token
+      # --- P1.3 CHANGE: Use new token file ---
+      - DD_PASSWORD_FILE=/run/secrets/ddclient_api_token
 
     secrets:
-      - cloudflare_api_token
+      # --- P1.3 CHANGE: Use new token ---
+      - ddclient_api_token
 
     healthcheck:
       test: ["CMD-SHELL", "pidof ddclient"]
@@ -248,8 +250,11 @@ secrets:
     file: ./secrets/.docker_secrets/push_installation_id
   push_installation_key:
     file: ./secrets/.docker_secrets/push_installation_key
-  cloudflare_api_token:
-    file: ./secrets/.docker_secrets/cloudflare_api_token
+  # --- P1.3 CHANGE: Define new split tokens ---
+  ddclient_api_token:
+    file: ./secrets/.docker_secrets/ddclient_api_token
+  fail2ban_api_token:
+    file: ./secrets/.docker_secrets/fail2ban_api_token
 
 # Network configuration
 networks:
