@@ -13,7 +13,7 @@ cd "$PROJECT_ROOT"
 source "lib/common.sh"
 init_common_lib "$0"
 source "lib/docker.sh"
-source "lib/crypto.sh"
+source "lib/crypto.sh" # Needed for checking age key if encrypting backups
 
 # --- Configuration ---
 DRY_RUN=false
@@ -35,7 +35,7 @@ OPTIONS:
     --help         Show this help
 
 CLEANUP TYPES:
-    standard    Log rotation, old backups, Docker cleanup
+    standard    Log rotation, old local & remote backups, Docker cleanup
     deep        Standard + system cache, temp files, package cache
     docker      Docker-specific cleanup (images, volumes, networks)
 
@@ -65,6 +65,10 @@ validate_environment() {
         log_error "System maintenance requires root privileges"
         log_info "Run with: sudo ./maintenance.sh"
         return 1
+    fi
+    # Need rclone for remote cleanup
+    if [[ "$CLEANUP_TYPE" == "standard" || "$CLEANUP_TYPE" == "deep" ]]; then
+        require_commands rclone || return 1
     fi
 
     return 0
@@ -187,17 +191,16 @@ cleanup_logs() {
     return 0
 }
 
-# --- Backup Cleanup ---
-cleanup_backups() {
-    log_info "Backup cleanup..."
+# --- Local Backup Cleanup ---
+cleanup_local_backups() {
+    log_info "Local backup cleanup..."
 
     local backup_dir="$PROJECT_ROOT/backups"
     if [[ ! -d "$backup_dir" ]]; then
-        log_info "No backup directory found, skipping backup cleanup"
+        log_info "No backup directory found, skipping local backup cleanup"
         return 0
     fi
 
-    # --- P10 FIX: Read retention from .env ---
     # Define retention periods from environment or use defaults
     local db_retention_days full_retention_days emergency_retention_days
     db_retention_days=$(get_config_value "DB_BACKUP_RETENTION_DAYS" "14")
@@ -205,11 +208,11 @@ cleanup_backups() {
     emergency_retention_days=$(get_config_value "EMERGENCY_BACKUP_RETENTION_DAYS" "90")
 
     # Clean up old database backups
-    log_info "Cleaning database backups (retention: ${db_retention_days} days)..."
+    log_info "Cleaning local database backups (retention: ${db_retention_days} days)..."
     if [[ "$DRY_RUN" == "true" ]]; then
         local old_db_backups
         old_db_backups=$(find "$backup_dir/db" -name "*.age" -mtime +${db_retention_days} 2>/dev/null | wc -l)
-        log_info "[DRY RUN] Would remove $old_db_backups old database backups"
+        log_info "[DRY RUN] Would remove $old_db_backups old local database backups"
     else
         local removed_db=0
         while IFS= read -r -d '' backup_file; do
@@ -218,16 +221,16 @@ cleanup_backups() {
         done < <(find "$backup_dir/db" -name "*.age" -mtime +${db_retention_days} -print0 2>/dev/null)
 
         if [[ $removed_db -gt 0 ]]; then
-            log_success "Removed $removed_db old database backups"
+            log_success "Removed $removed_db old local database backups"
         fi
     fi
 
     # Clean up old full backups
-    log_info "Cleaning full backups (retention: ${full_retention_days} days)..."
+    log_info "Cleaning local full backups (retention: ${full_retention_days} days)..."
     if [[ "$DRY_RUN" == "true" ]]; then
         local old_full_backups
         old_full_backups=$(find "$backup_dir/full" -name "*.age" -mtime +${full_retention_days} 2>/dev/null | wc -l)
-        log_info "[DRY RUN] Would remove $old_full_backups old full backups"
+        log_info "[DRY RUN] Would remove $old_full_backups old local full backups"
     else
         local removed_full=0
         while IFS= read -r -d '' backup_file; do
@@ -236,16 +239,16 @@ cleanup_backups() {
         done < <(find "$backup_dir/full" -name "*.age" -mtime +${full_retention_days} -print0 2>/dev/null)
 
         if [[ $removed_full -gt 0 ]]; then
-            log_success "Removed $removed_full old full backups"
+            log_success "Removed $removed_full old local full backups"
         fi
     fi
 
     # Clean up old emergency kits (keep longer)
-    log_info "Cleaning emergency kits (retention: ${emergency_retention_days} days)..."
+    log_info "Cleaning local emergency kits (retention: ${emergency_retention_days} days)..."
     if [[ "$DRY_RUN" == "true" ]]; then
         local old_emergency
         old_emergency=$(find "$backup_dir/emergency" -name "*.age" -mtime +${emergency_retention_days} 2>/dev/null | wc -l)
-        log_info "[DRY RUN] Would remove $old_emergency old emergency kits"
+        log_info "[DRY RUN] Would remove $old_emergency old local emergency kits"
     else
         local removed_emergency=0
         while IFS= read -r -d '' backup_file; do
@@ -254,13 +257,77 @@ cleanup_backups() {
         done < <(find "$backup_dir/emergency" -name "*.age" -mtime +${emergency_retention_days} -print0 2>/dev/null)
 
         if [[ $removed_emergency -gt 0 ]]; then
-            log_success "Removed $removed_emergency old emergency kits"
+            log_success "Removed $removed_emergency old local emergency kits"
         fi
     fi
-    # --- END P10 FIX ---
 
     return 0
 }
+
+# --- Remote Backup Cleanup (NEW) ---
+cleanup_remote_backups() {
+    log_info "Remote backup cleanup (via rclone)..."
+
+    local remote_name
+    remote_name=$(get_config_value "RCLONE_REMOTE_NAME" "")
+
+    if [[ -z "$remote_name" ]] || [[ "$remote_name" == "CHANGE_ME" ]]; then
+        log_warn "RCLONE_REMOTE_NAME not configured in .env. Skipping remote backup cleanup."
+        return 0 # Return success, it's just not configured
+    fi
+
+    local remote_base_path="$remote_name:vaultwarden_backups" # Standardized remote path
+
+    # Check if remote base path exists
+    if ! rclone lsd "$remote_base_path" >/dev/null 2>&1; then
+        log_warn "Remote backup path '$remote_base_path' not found or inaccessible. Skipping remote cleanup."
+        return 0
+    fi
+
+    # Define retention periods from environment or use defaults
+    local db_retention_days full_retention_days emergency_retention_days
+    db_retention_days=$(get_config_value "DB_BACKUP_RETENTION_DAYS" "14")
+    full_retention_days=$(get_config_value "FULL_BACKUP_RETENTION_DAYS" "30")
+    emergency_retention_days=$(get_config_value "EMERGENCY_BACKUP_RETENTION_DAYS" "90")
+
+    local rclone_opts=("--log-level" "INFO") # Log rclone actions
+    [[ "$DRY_RUN" == "true" ]] && rclone_opts+=("--dry-run")
+
+    local cleanup_failed=false
+
+    # Cleanup DB backups
+    log_info "Cleaning remote database backups (older than ${db_retention_days} days)..."
+    if ! rclone delete "${rclone_opts[@]}" --min-age "${db_retention_days}d" "${remote_base_path}/db/"; then
+        log_error "Failed to clean remote database backups"
+        cleanup_failed=true
+    else
+        log_success "Remote database backup cleanup command executed successfully"
+    fi
+
+    # Cleanup Full backups
+    log_info "Cleaning remote full backups (older than ${full_retention_days} days)..."
+    if ! rclone delete "${rclone_opts[@]}" --min-age "${full_retention_days}d" "${remote_base_path}/full/"; then
+        log_error "Failed to clean remote full backups"
+        cleanup_failed=true
+    else
+        log_success "Remote full backup cleanup command executed successfully"
+    fi
+
+    # Cleanup Emergency backups
+    log_info "Cleaning remote emergency kits (older than ${emergency_retention_days} days)..."
+    if ! rclone delete "${rclone_opts[@]}" --min-age "${emergency_retention_days}d" "${remote_base_path}/emergency/"; then
+        log_error "Failed to clean remote emergency kits"
+        cleanup_failed=true
+    else
+        log_success "Remote emergency kit cleanup command executed successfully"
+    fi
+
+    if [[ "$cleanup_failed" == "true" ]]; then
+        return 1 # Indicate failure
+    fi
+    return 0 # Indicate success
+}
+
 
 # --- System Cleanup ---
 cleanup_system() {
@@ -296,7 +363,10 @@ cleanup_system() {
         else
             local removed_temp=0
             while IFS= read -r -d '' temp_file; do
-                rm -f "$temp_file" 2>/dev/null && ((removed_temp++))
+                # Add extra safety check: ensure we are not deleting /tmp or /var/tmp itself
+                if [[ "$temp_file" != "$temp_dir" ]]; then
+                    rm -f "$temp_file" 2>/dev/null && ((removed_temp++))
+                fi
             done < <(find "$temp_dir" -type f -mtime +7 -print0 2>/dev/null)
 
             if [[ $removed_temp -gt 0 ]]; then
@@ -448,23 +518,27 @@ main() {
     echo ""
     log_info "Starting $CLEANUP_TYPE maintenance..."
 
+    local exit_code=0
+
     # Execute maintenance based on type
     case "$CLEANUP_TYPE" in
         "standard")
-            cleanup_logs
-            cleanup_backups
-            cleanup_docker
-            cleanup_security_logs
+            cleanup_logs || exit_code=1
+            cleanup_local_backups || exit_code=1
+            cleanup_remote_backups || exit_code=1 # Added remote cleanup
+            cleanup_docker || exit_code=1
+            cleanup_security_logs || exit_code=1
             ;;
         "deep")
-            cleanup_logs
-            cleanup_backups
-            cleanup_docker
-            cleanup_security_logs
-            cleanup_system
+            cleanup_logs || exit_code=1
+            cleanup_local_backups || exit_code=1
+            cleanup_remote_backups || exit_code=1 # Added remote cleanup
+            cleanup_docker || exit_code=1
+            cleanup_security_logs || exit_code=1
+            cleanup_system || exit_code=1
             ;;
         "docker")
-            cleanup_docker
+            cleanup_docker || exit_code=1
             ;;
         *)
             log_error "Unknown cleanup type: $CLEANUP_TYPE"
@@ -474,7 +548,11 @@ main() {
     esac
 
     echo ""
-    log_success "Maintenance completed!"
+    if [[ $exit_code -eq 0 ]]; then
+      log_success "Maintenance completed successfully!"
+    else
+      log_error "Maintenance completed with errors."
+    fi
 
     # Show updated disk usage
     echo ""
@@ -487,6 +565,9 @@ main() {
     if [[ "$DRY_RUN" == "true" ]]; then
         echo "  Mode: Dry run (no changes made)"
     fi
+
+    exit $exit_code
 }
 
 main "$@"
+
