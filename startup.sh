@@ -81,8 +81,8 @@ prepare_docker_secrets() {
     fi
 
     # Get all secrets and create individual files
-    # --- FIX: Add push_installation_id ---
-    local secrets=("admin_token" "smtp_password" "push_installation_id" "push_installation_key" "cloudflare_api_token")
+    # --- FIX: Add admin_basic_auth_hash to ensure file is created for docker-compose ---
+    local secrets=("admin_token" "smtp_password" "push_installation_id" "push_installation_key" "cloudflare_api_token" "admin_basic_auth_hash")
 
     for secret in "${secrets[@]}"; do
         local value
