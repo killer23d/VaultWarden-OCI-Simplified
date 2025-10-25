@@ -12,6 +12,8 @@ cd "$PROJECT_ROOT"
 # --- Source Libraries ---
 source "lib/common.sh"
 init_common_lib "$0"
+# P14 FIX: Need docker library for container checks
+source "lib/docker.sh"
 
 # --- Configuration ---
 REMOVE_CRONS=false
@@ -237,6 +239,10 @@ setup_log_rotation() {
     local real_user
     real_user=$(get_real_user)
     local real_group=$(id -g -n "$real_user") || real_group="$real_user"
+    # P14 FIX: Get predictable container names from .env or defaults
+    local compose_project_name=$(get_config_value "COMPOSE_PROJECT_NAME" "vaultwarden")
+    local caddy_container_name="${compose_project_name}_caddy"
+    local fail2ban_container_name="${compose_project_name}_fail2ban"
 
 
     if [[ "$DRY_RUN" == "true" ]]; then
@@ -247,7 +253,7 @@ setup_log_rotation() {
     # Create logrotate configuration
     cat > "$logrotate_conf" << EOF
 # VaultWarden-OCI-NG Log Rotation
-$state_dir/logs/*/*.log {
+$state_dir/logs/caddy/*.log $state_dir/logs/vaultwarden/*.log $state_dir/logs/fail2ban/*.log {
     daily
     rotate 30
     compress
@@ -255,12 +261,27 @@ $state_dir/logs/*/*.log {
     missingok
     notifempty
     create 644 $real_user $real_group
+    sharedscripts
     postrotate
-        # Signal containers to reopen log files if needed
-        if [ -f "$PROJECT_ROOT/docker-compose.yml" ]; then
-             docker compose -f "$PROJECT_ROOT/docker-compose.yml" exec caddy caddy reload --config /etc/caddy/Caddyfile > /dev/null 2>&1 || true
-             docker compose -f "$PROJECT_ROOT/docker-compose.yml" exec fail2ban fail2ban-client flushlogs > /dev/null 2>&1 || true
+        # --- P14 FIX: Use docker kill HUP ---
+        log_info() { echo "\$(date '+%H:%M:%S') [INFO] [logrotate] \$*"; }
+        log_warn() { echo "\$(date '+%H:%M:%S') [WARN] [logrotate] \$*" >&2; }
+
+        if command -v docker >/dev/null 2>&1; then
+            # Check Caddy
+            if docker ps -q --filter name="^/${caddy_container_name}$" | grep -q .; then
+                log_info "Sending HUP signal to $caddy_container_name"
+                docker kill -s HUP "$caddy_container_name" || log_warn "Failed to send HUP to $caddy_container_name"
+            fi
+            # Check Fail2ban
+             if docker ps -q --filter name="^/${fail2ban_container_name}$" | grep -q .; then
+                log_info "Sending HUP signal to $fail2ban_container_name"
+                docker kill -s HUP "$fail2ban_container_name" || log_warn "Failed to send HUP to $fail2ban_container_name"
+            fi
+        else
+            log_warn "Docker command not found, cannot signal containers to reopen logs."
         fi
+        # --- END P14 FIX ---
     endscript
 }
 
@@ -421,3 +442,4 @@ main() {
 }
 
 main "$@"
+
