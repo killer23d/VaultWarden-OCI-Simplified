@@ -137,7 +137,7 @@ cleanup_logs() {
 
     local state_dir
     state_dir=$(get_config_value "PROJECT_STATE_DIR" "/var/lib/vaultwarden")
-    local log_dirs=("$state_dir/logs" "$PROJECT_ROOT/backups")
+    local log_dirs=("$state_dir/logs" "$PROJECT_ROOT/backups" "$PROJECT_ROOT/logs") # Added project logs dir
 
     for log_dir in "${log_dirs[@]}"; do
         if [[ ! -d "$log_dir" ]]; then
@@ -146,17 +146,18 @@ cleanup_logs() {
 
         log_info "Cleaning logs in: $log_dir"
 
-        # Remove logs older than 30 days
+        # Remove logs older than 30 days (make configurable?)
+        local log_retention_days=30
         if [[ "$DRY_RUN" == "true" ]]; then
             local old_logs
-            old_logs=$(find "$log_dir" -name "*.log" -type f -mtime +30 2>/dev/null | wc -l)
-            log_info "[DRY RUN] Would remove $old_logs log files older than 30 days"
+            old_logs=$(find "$log_dir" \( -name "*.log" -o -name "*.log.gz" \) -type f -mtime +${log_retention_days} 2>/dev/null | wc -l)
+            log_info "[DRY RUN] Would remove $old_logs log files older than ${log_retention_days} days"
         else
             local removed_count=0
             while IFS= read -r -d '' log_file; do
                 rm -f "$log_file"
                 ((removed_count++))
-            done < <(find "$log_dir" -name "*.log" -type f -mtime +30 -print0 2>/dev/null)
+            done < <(find "$log_dir" \( -name "*.log" -o -name "*.log.gz" \) -type f -mtime +${log_retention_days} -print0 2>/dev/null)
 
             if [[ $removed_count -gt 0 ]]; then
                 log_success "Removed $removed_count old log files from $log_dir"
@@ -164,16 +165,17 @@ cleanup_logs() {
         fi
 
         # Compress logs older than 7 days
+        local compress_days=7
         if has_command gzip; then
             if [[ "$DRY_RUN" == "true" ]]; then
                 local compress_logs
-                compress_logs=$(find "$log_dir" -name "*.log" -type f -mtime +7 ! -name "*.gz" 2>/dev/null | wc -l)
-                log_info "[DRY RUN] Would compress $compress_logs log files older than 7 days"
+                compress_logs=$(find "$log_dir" -name "*.log" -type f -mtime +${compress_days} ! -name "*.gz" 2>/dev/null | wc -l)
+                log_info "[DRY RUN] Would compress $compress_logs log files older than ${compress_days} days"
             else
                 local compressed_count=0
                 while IFS= read -r -d '' log_file; do
                     gzip "$log_file" && ((compressed_count++))
-                done < <(find "$log_dir" -name "*.log" -type f -mtime +7 ! -name "*.gz" -print0 2>/dev/null)
+                done < <(find "$log_dir" -name "*.log" -type f -mtime +${compress_days} ! -name "*.gz" -print0 2>/dev/null)
 
                 if [[ $compressed_count -gt 0 ]]; then
                     log_success "Compressed $compressed_count log files in $log_dir"
@@ -195,10 +197,12 @@ cleanup_backups() {
         return 0
     fi
 
-    # Define retention periods
-    local db_retention_days=14
-    local full_retention_days=28
-    local emergency_retention_days=90
+    # --- P10 FIX: Read retention from .env ---
+    # Define retention periods from environment or use defaults
+    local db_retention_days full_retention_days emergency_retention_days
+    db_retention_days=$(get_config_value "DB_BACKUP_RETENTION_DAYS" "14")
+    full_retention_days=$(get_config_value "FULL_BACKUP_RETENTION_DAYS" "30")
+    emergency_retention_days=$(get_config_value "EMERGENCY_BACKUP_RETENTION_DAYS" "90")
 
     # Clean up old database backups
     log_info "Cleaning database backups (retention: ${db_retention_days} days)..."
@@ -253,6 +257,7 @@ cleanup_backups() {
             log_success "Removed $removed_emergency old emergency kits"
         fi
     fi
+    # --- END P10 FIX ---
 
     return 0
 }
@@ -339,7 +344,7 @@ show_disk_usage() {
         du -sh "$state_dir" 2>/dev/null || echo "  Cannot determine state directory usage"
 
         # Break down by subdirectory
-        local subdirs=("data" "logs" "backups")
+        local subdirs=("data" "logs" "caddy" "ddclient") # Added caddy/ddclient
         for subdir in "${subdirs[@]}"; do
             if [[ -d "$state_dir/$subdir" ]]; then
                 local size
@@ -363,38 +368,54 @@ show_disk_usage() {
 cleanup_security_logs() {
     log_info "Cleaning security-related logs..."
 
-    # Clean fail2ban logs
-    local fail2ban_log="/var/log/fail2ban.log"
-    if [[ -f "$fail2ban_log" ]]; then
+    # Clean fail2ban logs (check state dir first)
+    local state_dir fail2ban_log_dir
+    state_dir=$(get_config_value "PROJECT_STATE_DIR" "/var/lib/vaultwarden")
+    fail2ban_log_dir="$state_dir/logs/fail2ban"
+    local fail2ban_log="$fail2ban_log_dir/fail2ban.log" # Path used by fail2ban container
+
+    if [[ -d "$fail2ban_log_dir" ]] && [[ -f "$fail2ban_log" ]]; then
         if [[ "$DRY_RUN" == "true" ]]; then
-            log_info "[DRY RUN] Would rotate fail2ban log"
+            log_info "[DRY RUN] Would check size and potentially rotate fail2ban log: $fail2ban_log"
         else
             # Rotate fail2ban log if it's large
             local log_size
             log_size=$(stat -c%s "$fail2ban_log" 2>/dev/null || echo "0")
             if [[ $log_size -gt 10485760 ]]; then  # 10MB
-                mv "$fail2ban_log" "$fail2ban_log.old" 2>/dev/null || true
-                systemctl reload fail2ban 2>/dev/null || true
+                log_info "Rotating large fail2ban log..."
+                # Use logrotate command if available for robustness
+                if has_command logrotate && [[ -f /etc/logrotate.d/vaultwarden ]]; then
+                     logrotate --force /etc/logrotate.d/vaultwarden || log_warn "logrotate command failed for fail2ban"
+                else
+                    # Fallback to manual rotation if logrotate isn't configured/available
+                    mv "$fail2ban_log" "$fail2ban_log.$(date +%Y%m%d)" 2>/dev/null || true
+                    # Signal fail2ban container to reopen log file (if running)
+                    if is_service_running fail2ban; then
+                        docker compose exec fail2ban fail2ban-client flushlogs >/dev/null 2>&1 || log_warn "Failed to signal fail2ban to reopen log"
+                    fi
+                fi
                 log_success "Rotated large fail2ban log"
             fi
         fi
     fi
 
-    # Clean auth logs older than 30 days
-    local auth_log_dir="/var/log"
-    if [[ -d "$auth_log_dir" ]]; then
-        if [[ "$DRY_RUN" == "true" ]]; then
-            local old_auth_logs
-            old_auth_logs=$(find "$auth_log_dir" -name "auth.log.*" -mtime +30 2>/dev/null | wc -l)
-            log_info "[DRY RUN] Would remove $old_auth_logs old auth logs"
-        else
-            local removed_auth=0
-            while IFS= read -r -d '' auth_file; do
-                rm -f "$auth_file" && ((removed_auth++))
-            done < <(find "$auth_log_dir" -name "auth.log.*" -mtime +30 -print0 2>/dev/null)
+    # Clean system auth logs older than 30 days (if running as root)
+    if is_root; then
+        local auth_log_dir="/var/log"
+        if [[ -d "$auth_log_dir" ]]; then
+            if [[ "$DRY_RUN" == "true" ]]; then
+                local old_auth_logs
+                old_auth_logs=$(find "$auth_log_dir" \( -name "auth.log.*" -o -name "syslog.*" \) -mtime +30 2>/dev/null | wc -l)
+                log_info "[DRY RUN] Would remove $old_auth_logs old auth/syslog logs"
+            else
+                local removed_auth=0
+                while IFS= read -r -d '' auth_file; do
+                    rm -f "$auth_file" && ((removed_auth++))
+                done < <(find "$auth_log_dir" \( -name "auth.log.*" -o -name "syslog.*" \) -mtime +30 -print0 2>/dev/null)
 
-            if [[ $removed_auth -gt 0 ]]; then
-                log_success "Removed $removed_auth old auth logs"
+                if [[ $removed_auth -gt 0 ]]; then
+                    log_success "Removed $removed_auth old system auth/syslog logs"
+                fi
             fi
         fi
     fi
@@ -431,7 +452,7 @@ main() {
     case "$CLEANUP_TYPE" in
         "standard")
             cleanup_logs
-            cleanup_backups  
+            cleanup_backups
             cleanup_docker
             cleanup_security_logs
             ;;
