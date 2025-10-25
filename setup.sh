@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 # setup.sh - Complete VaultWarden-OCI-NG system setup with library integration
-# Corrected version addressing v4 review feedback
 
 set -euo pipefail
 
@@ -220,14 +219,20 @@ configure_firewall() {
     ufw default deny incoming >/dev/null 2>&1
     ufw default allow outgoing >/dev/null 2>&1
 
+    # --- P7 FIX: Smart SSH Port Detection ---
     # Allow SSH (be careful not to lock ourselves out)
-    local ssh_port="22"
-    if [[ -n "${SSH_PORT:-}" ]]; then
-        ssh_port="$SSH_PORT"
+    # Priority: 1. $SSH_PORT env var, 2. sshd_config, 3. default 22
+    local ssh_port="${SSH_PORT:-}"
+    if [[ -z "$ssh_port" ]]; then
+        # Grep for the 'Port' directive, ignore comments, get last value
+        ssh_port=$(grep -E '^[[:space:]]*Port[[:space:]]+[0-9]+' /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' | tail -1)
     fi
+    # Default to 22 if still empty
+    ssh_port="${ssh_port:-22}"
 
     ufw allow "$ssh_port/tcp" comment "SSH" >/dev/null 2>&1
     log_success "SSH access allowed on port $ssh_port"
+    # --- END P7 FIX ---
 
     # --- FIX: Web rules are now handled by update-cloudflare-ips.sh ---
     # We will call that script later in main() to populate web rules.
@@ -252,34 +257,43 @@ setup_directories() {
     real_user=$(get_real_user)
     local state_dir="/var/lib/vaultwarden"
 
+    # --- P5 FIX: Get user's real GID ---
+    local real_group
+    real_group=$(id -g -n "$real_user")
+    if [[ -z "$real_group" ]]; then
+        real_group="$real_user"
+    fi
+    local owner="$real_user:$real_group"
+    # --- END P5 FIX ---
+
     # Create main directories using library function
-    ensure_dir "$state_dir" 755 "$real_user:$real_user"
+    ensure_dir "$state_dir" 755 "$owner"
 
     # Data directory with stricter permissions (addresses v4 review)
-    ensure_dir "$state_dir/data" 700 "$real_user:$real_user"
+    ensure_dir "$state_dir/data" 700 "$owner"
     log_info "Data directory created with strict permissions (700)"
 
-    ensure_dir "$state_dir/logs" 755 "$real_user:$real_user"
-    ensure_dir "$state_dir/backups" 755 "$real_user:$real_user"
-    ensure_dir "$state_dir/caddy" 755 "$real_user:$real_user"
-    ensure_dir "$state_dir/caddy/data" 755 "$real_user:$real_user"
-    ensure_dir "$state_dir/caddy/config" 755 "$real_user:$real_user"
+    ensure_dir "$state_dir/logs" 755 "$owner"
+    ensure_dir "$state_dir/backups" 755 "$owner"
+    ensure_dir "$state_dir/caddy" 755 "$owner"
+    ensure_dir "$state_dir/caddy/data" 755 "$owner"
+    ensure_dir "$state_dir/caddy/config" 755 "$owner"
 
     # Create log subdirectories
-    ensure_dir "$state_dir/logs/caddy" 755 "$real_user:$real_user"
-    ensure_dir "$state_dir/logs/vaultwarden" 755 "$real_user:$real_user"
-    ensure_dir "$state_dir/logs/fail2ban" 755 "$real_user:$real_user"
+    ensure_dir "$state_dir/logs/caddy" 755 "$owner"
+    ensure_dir "$state_dir/logs/vaultwarden" 755 "$owner"
+    ensure_dir "$state_dir/logs/fail2ban" 755 "$owner"
 
     # Create project directories
-    ensure_dir "$PROJECT_ROOT/secrets" 700 "$real_user:$real_user"
-    ensure_dir "$PROJECT_ROOT/secrets/keys" 700 "$real_user:$real_user"
-    ensure_dir "$PROJECT_ROOT/backups" 755 "$real_user:$real_user"
-    ensure_dir "$PROJECT_ROOT/backups/db" 755 "$real_user:$real_user"
-    ensure_dir "$PROJECT_ROOT/backups/full" 755 "$real_user:$real_user"
-    ensure_dir "$PROJECT_ROOT/backups/emergency" 755 "$real_user:$real_user"
+    ensure_dir "$PROJECT_ROOT/secrets" 700 "$owner"
+    ensure_dir "$PROJECT_ROOT/secrets/keys" 700 "$owner"
+    ensure_dir "$PROJECT_ROOT/backups" 755 "$owner"
+    ensure_dir "$PROJECT_ROOT/backups/db" 755 "$owner"
+    ensure_dir "$PROJECT_ROOT/backups/full" 755 "$owner"
+    ensure_dir "$PROJECT_ROOT/backups/emergency" 755 "$owner"
 
     # --- FIX: Ensure logs directory exists for cron output ---
-    ensure_dir "$PROJECT_ROOT/logs" 755 "$real_user:$real_user"
+    ensure_dir "$PROJECT_ROOT/logs" 755 "$owner"
 
     log_success "Directory structure created with appropriate permissions"
     return 0
@@ -313,7 +327,14 @@ setup_age_keys() {
         # Set ownership
         local real_user
         real_user=$(get_real_user)
-        chown "$real_user:$real_user" "$private_key_file" "$public_key_file"
+        # --- P5 FIX: Get user's real GID ---
+        local real_group
+        real_group=$(id -g -n "$real_user")
+        if [[ -z "$real_group" ]]; then
+            real_group="$real_user"
+        fi
+        chown "$real_user:$real_group" "$private_key_file" "$public_key_file"
+        # --- END P5 FIX ---
 
         # Show public key
         echo ""
@@ -357,7 +378,14 @@ EOF
     # Set ownership
     local real_user
     real_user=$(get_real_user)
-    chown "$real_user:$real_user" "$sops_config"
+    # --- P5 FIX: Get user's real GID ---
+    local real_group
+    real_group=$(id -g -n "$real_user")
+    if [[ -z "$real_group" ]]; then
+        real_group="$real_user"
+    fi
+    chown "$real_user:$real_group" "$sops_config"
+    # --- END P5 FIX ---
 
     log_success "SOPS configuration created"
     return 0
@@ -369,6 +397,15 @@ setup_environment() {
 
     local env_file="$PROJECT_ROOT/.env"
     local state_dir="/var/lib/vaultwarden"
+    # --- P5 FIX: Get real user and group IDs ---
+    local real_user
+    real_user=$(get_real_user)
+    local real_uid
+    real_uid=$(id -u "$real_user")
+    local real_gid
+    real_gid=$(id -g "$real_user")
+    # --- END P5 FIX ---
+
 
     # Check if .env already exists
     if [[ -f "$env_file" ]]; then
@@ -397,6 +434,20 @@ ADMIN_EMAIL=$ADMIN_EMAIL
 PROJECT_NAME=vaultwarden-oci
 PROJECT_STATE_DIR=$state_dir
 COMPOSE_PROJECT_NAME=vaultwarden
+
+# --- P5 FIX: Add PUID/PGID ---
+# User/Group IDs for container permissions
+# Set automatically to match the user who ran setup.sh
+PUID=$real_uid
+PGID=$real_gid
+# --- END P5 FIX ---
+
+# --- P7 NOTE: Add SSH_PORT ---
+# Custom SSH port (if not 22)
+# IMPORTANT: If you use a custom SSH port, set it here to prevent
+# the automated firewall from locking you out.
+# SSH_PORT=2222
+# --- END P7 NOTE ---
 
 # Container Versions (Single source of truth per v4 review)
 VAULTWARDEN_VERSION=1.30.5
@@ -452,9 +503,14 @@ EOF
     secure_file "$env_file" 600
 
     # Set ownership
-    local real_user
-    real_user=$(get_real_user)
-    chown "$real_user:$real_user" "$env_file"
+    # --- P5 FIX: Use correct owner variables ---
+    local real_group
+    real_group=$(id -g -n "$real_user")
+    if [[ -z "$real_group" ]]; then
+        real_group="$real_user"
+    fi
+    chown "$real_user:$real_group" "$env_file"
+    # --- END P5 FIX ---
 
     log_success "Environment configuration created with explicit version definitions"
     return 0
@@ -505,8 +561,12 @@ backup_passphrase: $backup_pass
 # Optional: Push notification key
 push_installation_key: ""
 
-# Optional: Cloudflare API token for DNS challenges
-cloudflare_api_token: ""
+# --- P1 CHANGE: Split Cloudflare token (from previous step) ---
+# Cloudflare API token for DDNS (Permissions: Zone:DNS:Edit)
+ddclient_api_token: CHANGE_ME_DDCLIENT_API_TOKEN
+
+# Cloudflare API token for Fail2Ban/Caddy (Permissions: Zone:Firewall Services:Edit)
+fail2ban_api_token: CHANGE_ME_FAIL2BAN_API_TOKEN
 EOF
 
     # Encrypt secrets using library function
@@ -516,13 +576,23 @@ EOF
         # Set ownership
         local real_user
         real_user=$(get_real_user)
-        chown "$real_user:$real_user" "$secrets_file"
+        # --- P5 FIX: Get user's real GID ---
+        local real_group
+        real_group=$(id -g -n "$real_user")
+        if [[ -z "$real_group" ]]; then
+            real_group="$real_user"
+        fi
+        chown "$real_user:$real_group" "$secrets_file"
+        # --- END P5 FIX ---
+
 
         log_warn "IMPORTANT: Update placeholder values in secrets:"
         log_info "  Run: ./edit-secrets.sh"
         log_info "  Update admin_basic_auth_hash with bcrypt hash"
         log_info "  Configure SMTP password if using email"
-        log_info "  The admin_basic_auth_hash is required for Caddy admin protection"
+        # --- P1 CHANGE: Updated help text (from previous step) ---
+        log_info "  Update ddclient_api_token (for dynamic DNS)"
+        log_info "  Update fail2ban_api_token (for firewall bans)"
     else
         log_error "Failed to encrypt secrets file"
         return 1
@@ -571,11 +641,19 @@ setup_script_permissions() {
                    "update.sh" "maintenance.sh" "cron-setup.sh" "update-cloudflare-ips.sh")
     local real_user
     real_user=$(get_real_user)
+    # --- P5 FIX: Get user's real GID ---
+    local real_group
+    real_group=$(id -g -n "$real_user")
+    if [[ -z "$real_group" ]]; then
+        real_group="$real_user"
+    fi
+    local owner="$real_user:$real_group"
+    # --- END P5 FIX ---
 
     for script in "${scripts[@]}"; do
         if [[ -f "$PROJECT_ROOT/$script" ]]; then
             chmod +x "$PROJECT_ROOT/$script"
-            chown "$real_user:$real_user" "$PROJECT_ROOT/$script"
+            chown "$owner" "$PROJECT_ROOT/$script"
             log_success "Made $script executable"
         else
             log_warn "Script not found: $script"
@@ -586,7 +664,7 @@ setup_script_permissions() {
     if [[ -d "$PROJECT_ROOT/lib" ]]; then
         chmod -R 644 "$PROJECT_ROOT/lib"/*.sh
         chmod +x "$PROJECT_ROOT/lib"  # Directory needs execute
-        chown -R "$real_user:$real_user" "$PROJECT_ROOT/lib"
+        chown -R "$owner" "$PROJECT_ROOT/lib"
         log_success "Library permissions set"
     fi
 
@@ -703,11 +781,13 @@ main() {
     echo "Next steps:"
     echo "  1. Update secrets: ./edit-secrets.sh"
     echo "     • CRITICAL: Set admin_basic_auth_hash for Caddy admin protection"
-    echo "     • CRITICAL: Set cloudflare_api_token"
+    echo "     • CRITICAL: Set ddclient_api_token (for DNS)"
+    echo "     • CRITICAL: Set fail2ban_api_token (for firewall)"
     echo "     • Configure SMTP password if using email notifications"
     echo "  2. Review configuration: nano .env"
     echo "     • CRITICAL: Set CLOUDFLARE_ZONE_ID"
     echo "     • CRITICAL: Set RCLONE_REMOTE_NAME"
+    echo "     • NOTE: Set SSH_PORT if you use a custom port"
     echo "  3. Configure Rclone: rclone config (for the user '$real_user')"
     echo "  4. Start services: ./startup.sh"
     echo "  5. Setup automation: sudo ./cron-setup.sh"
@@ -717,9 +797,10 @@ main() {
     echo "Admin panel: https://$DOMAIN/admin (protected by basic auth)"
     echo ""
     log_warn "IMPORTANT: The admin panel requires admin_basic_auth_hash to be configured!"
-    log_warn "IMPORTANT: The stack requires CLOUDFLARE_ZONE_ID and cloudflare_api_token to function!"
+    log_warn "IMPORTANT: The stack requires CLOUDFLARE_ZONE_ID and API tokens to function!"
     log_warn "IMPORTANT: Offsite backup requires rclone to be configured and RCLONE_REMOTE_NAME to be set!"
     log_info "Setup completed in $(date)"
 }
 
 main "$@"
+
